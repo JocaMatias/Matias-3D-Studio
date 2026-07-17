@@ -1,0 +1,120 @@
+.capturePage :global(.layout) {
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 320px);
+  align-items: start;
+}
+
+.capturePage :global(.layout) > section,
+.capturePage :global(.layout) > aside {
+  min-width: 0;
+}
+
+.capturePage :global(.drop) {
+  display: grid;
+  width: 100%;
+  min-height: 210px;
+  padding: 38px 25px;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.capturePage :global(.drop) h3,
+.capturePage :global(.drop) p {
+  margin: 0;
+}
+
+.capturePage :global(.drop) svg {
+  margin-bottom: 4px;
+}
+
+.capturePage :global(.badge) {
+  display: inline-flex;
+  max-width: 100%;
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.capturePage :global(aside .card) {
+  overflow: hidden;
+}
+
+.strategy {
+  margin: 18px 0 14px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.strategy p {
+  margin-bottom: 0;
+}
+
+.metrics {
+  display: grid;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.metrics > div {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.metrics strong {
+  color: var(--text);
+}
+
+.metrics i {
+  grid-column: 1 / -1;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #1b2d29;
+}
+
+.metrics b {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--mint2), var(--mint));
+}
+
+.suggestion {
+  padding: 12px;
+  border: 1px solid #285c4e;
+  border-radius: 10px;
+  background: #10231f;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.suggestion strong {
+  color: var(--mint);
+}
+
+@media (max-width: 960px) {
+  .capturePage :global(.layout) {
+    grid-template-columns: minmax(0, 1fr) 280px;
+  }
+}
+
+@media (max-width: 800px) {
+  .capturePage :global(.pagehead) {
+    flex-direction: column;
+  }
+
+  .capturePage :global(.layout) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .capturePage :global(.drop) {
+    min-height: 180px;
+    padding: 30px 18px;
+  }
+}

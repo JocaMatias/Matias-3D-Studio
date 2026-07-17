@@ -1,0 +1,16 @@
+.mock-blocker {
+  min-height: 330px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  padding: 48px;
+}
+
+.mock-blocker > div { max-width: 650px; }
+.mock-blocker h2 { font-size: 30px; margin: 10px 0; }
+.mock-blocker .btn { margin-top: 15px; }
+
+@media (max-width: 800px) {
+  .mock-blocker { align-items: flex-start; padding: 28px; }
+}

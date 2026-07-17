@@ -1,0 +1,38 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports: ["3000:3000"]
+    depends_on: [backend]
+  backend:
+    build: ./backend
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://studio:studio@postgres:5432/studio
+      STORAGE_ROOT: /storage
+      RECONSTRUCTION_MODE: ${RECONSTRUCTION_MODE:-mock}
+      FRONTEND_ORIGIN: http://localhost:3000
+    volumes: ["studio_storage:/storage"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+  worker:
+    build: ./backend
+    command: ["python", "-c", "import time; print('Worker reservado para Celery/Redis no modo distribuído'); time.sleep(1000000)"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://studio:studio@postgres:5432/studio
+      STORAGE_ROOT: /storage
+      RECONSTRUCTION_MODE: ${RECONSTRUCTION_MODE:-mock}
+    volumes: ["studio_storage:/storage"]
+    depends_on: [postgres, redis]
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_USER: studio, POSTGRES_PASSWORD: studio, POSTGRES_DB: studio}
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U studio"], interval: 5s, timeout: 5s, retries: 10}
+  redis:
+    image: redis:7-alpine
+    volumes: ["redis_data:/data"]
+volumes: {studio_storage: {}, postgres_data: {}, redis_data: {}}

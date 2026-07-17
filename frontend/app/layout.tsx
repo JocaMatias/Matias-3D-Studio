@@ -1,0 +1,3 @@
+import "./globals.css"; import "./mock.css"; import Link from "next/link"; import { Box } from "lucide-react";
+export const metadata={title:"ImageTo3D Studio",description:"Reconstrução 3D a partir de fotografias"};
+export default function Layout({children}:{children:React.ReactNode}){return <html lang="pt"><body><header className="shell nav"><Link href="/" className="brand"><span className="logo"><Box size={17}/></span> ImageTo3D <span style={{color:"var(--mint)"}}>Studio</span></Link><nav className="navlinks"><Link href="/projects">Projetos</Link><Link href="/#guide">Guia de captura</Link><a href="http://localhost:8000/docs" target="_blank">API</a></nav></header>{children}</body></html>}

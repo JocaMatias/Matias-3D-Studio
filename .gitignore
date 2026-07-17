@@ -1,0 +1,14 @@
+node_modules/
+.next/
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+*.db
+storage/*
+!storage/.gitkeep
+backend/storage/*
+!backend/storage/.gitkeep
+.env
+tools/*
+!tools/.gitkeep
