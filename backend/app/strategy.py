@@ -61,12 +61,39 @@ def strategy_for_images(
     )
 
 
+def strategy_for_project(
+    project_type: str,
+    usable_images: int,
+    photogrammetry_trackability: str = "unknown",
+) -> ReconstructionStrategy:
+    if usable_images < MINIMUM_AI_IMAGES:
+        return strategy_for_images(usable_images, photogrammetry_trackability)
+    if project_type == "ai_references":
+        return ReconstructionStrategy(
+            "ai_references",
+            "IA multivista para referências",
+            "A vista principal ancora o objeto; as restantes completam forma e textura sem tentar alinhar câmaras fotográficas fictícias.",
+            True,
+            False,
+        )
+    if project_type == "hybrid" and not (usable_images >= 20 and photogrammetry_trackability == "high"):
+        return ReconstructionStrategy(
+            "ai_hybrid",
+            "IA híbrida guiada",
+            "As vistas observadas ancoram a forma e as referências adicionais ajudam a completar zonas ocultas.",
+            True,
+            False,
+        )
+    return strategy_for_images(usable_images, photogrammetry_trackability)
+
+
 def capture_metrics(
     usable_images: int,
     validation_score: int | None,
     photogrammetry_trackability: str = "unknown",
+    project_type: str = "real_photos",
 ) -> dict:
-    strategy = strategy_for_images(usable_images, photogrammetry_trackability)
+    strategy = strategy_for_project(project_type, usable_images, photogrammetry_trackability)
     technical = validation_score or 0
     if usable_images < MINIMUM_AI_IMAGES:
         confidence = min(28, usable_images * 6)
@@ -101,9 +128,9 @@ def next_capture_suggestion(usable_images: int) -> str:
     if usable_images < 5:
         return "Fotografa frente, traseira, lado esquerdo, lado direito e uma vista ligeiramente superior."
     if usable_images < 8:
-        return "A próxima vista mais útil é um ângulo intermédio ou uma vista do lado da pega."
+        return "A próxima vista mais útil é um ângulo intermédio do lado com mais saliências ou ligações."
     if usable_images < 10:
         return "Adiciona uma vista superior oblíqua e uma vista da base, sem mudar a distância."
     if usable_images < 20:
-        return "Já podes reconstruir; novas vistas melhoram sobretudo cavidades, pega e zonas ocultas."
+        return "Já podes reconstruir; novas vistas melhoram sobretudo cavidades, ligações finas e zonas ocultas."
     return "Cobertura elevada: acrescenta apenas vistas de cavidades, base ou zonas ainda ocultas."

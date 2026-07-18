@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" role="img" aria-labelledby="title">
+  <title id="title">Matias 3D Studio</title>
+  <g transform="translate(8 -20) scale(.68)">
+    <path fill="#67e8c4" d="M64 102 256 230 448 102v83L256 313 64 185Z"/>
+    <path fill="#161b1a" d="m64 204 105 69v99L64 442Zm384 0-105 69v99l105 70Z"/>
+  </g>
+  <text x="350" y="207" fill="#161b1a" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="134" font-weight="750" letter-spacing="-5">Matias <tspan fill="#22c99a">3D</tspan> Studio</text>
+</svg>

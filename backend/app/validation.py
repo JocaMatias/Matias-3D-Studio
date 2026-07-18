@@ -39,7 +39,7 @@ def photogrammetry_trackability(images) -> dict:
         }
     median_detail = float(np.median(values))
     # Stored scores are measured at the original phone resolution, where a
-    # detailed ceramic pattern typically sits around 45–140 while a smooth
+    # detailed surface patterns typically sit around 45–140 while a smooth
     # studio object is around 15–28.
     score = int(np.clip(round((median_detail - 15) / 0.75), 0, 100))
     if score >= 45:
@@ -56,6 +56,7 @@ def photogrammetry_trackability(images) -> dict:
 
 def validate_project(db: Session, project: Project) -> dict:
     hashes: list[tuple[str, int]] = []
+    signatures: list[tuple[object, np.ndarray]] = []
     approved = warnings = rejected = 0
     flash_count = background_dominant_count = 0
 
@@ -92,6 +93,14 @@ def validate_project(db: Session, project: Project) -> dict:
                 border_mask[height // 5 : height * 4 // 5, width // 5 : width * 4 // 5] = False
                 border_energy = float(edge_energy[border_mask].mean())
                 digest = _difference_hash(rgb)
+                signature_parts = []
+                center_rgb = np.asarray(rgb, dtype=np.uint8)[height // 6 : height * 5 // 6, width // 6 : width * 5 // 6]
+                for channel in range(3):
+                    histogram, _ = np.histogram(center_rgb[:, :, channel], bins=16, range=(0, 256), density=True)
+                    signature_parts.append(histogram)
+                signature = np.concatenate(signature_parts).astype(np.float32)
+                signature /= max(float(np.linalg.norm(signature)), 1e-8)
+                signatures.append((item, signature))
 
                 item.blur_score = round(blur, 2)
                 item.exposure_score = round(max(0, 100 - abs(mean - 127.5) / 1.275), 2)
@@ -133,6 +142,24 @@ def validate_project(db: Session, project: Project) -> dict:
             rejected += 1
         item.validation_messages = messages
 
+    # This is deliberately labelled as a visual consistency estimate. Colour
+    # and tonal signatures can identify outliers between AI references, but do
+    # not prove that hidden geometry is identical.
+    consistency_estimate = 0
+    if signatures:
+        primary = next((signature for item, signature in signatures if item.is_primary), signatures[0][1])
+        scores = []
+        for item, signature in signatures:
+            consistency = int(np.clip(round(float(np.dot(primary, signature)) * 100), 0, 100))
+            item.consistency_score = consistency
+            scores.append(consistency)
+            if project.project_type in {"ai_references", "hybrid"} and consistency < 38 and item.validation_status == "approved":
+                item.validation_status = "warning"
+                item.validation_messages = [*item.validation_messages, "Esta vista difere muito da referência principal; confirma forma, cores e detalhes."]
+                approved -= 1
+                warnings += 1
+        consistency_estimate = round(float(np.mean(scores)))
+
     count = len(project.images)
     usable = approved + warnings
     # Ten strong views already represent full capture quantity for the AI path.
@@ -160,9 +187,18 @@ def validate_project(db: Session, project: Project) -> dict:
         global_warnings.append(f"Flash/reflexos fortes detetados em {flash_count} imagem(ns).")
     if background_dominant_count > count * 0.35:
         global_warnings.append("O fundo tem mais detalhe do que o objeto; a segmentação automática irá isolá-lo.")
+    if project.project_type in {"ai_references", "hybrid"} and consistency_estimate < 58:
+        global_warnings.append("As referências têm baixa consistência visual. Confirma que representam o mesmo objeto e define a vista principal.")
+
+    diversity_values = [_hamming(left[1], right[1]) for index, left in enumerate(hashes) for right in hashes[index + 1 :]]
+    view_diversity = int(np.clip(round((float(np.median(diversity_values)) if diversity_values else 0) / 24 * 100), 0, 100))
 
     return {
         "score": score,
+        "capture_preparation_score": score,
+        "input_quality_score": technical_score,
+        "structural_consistency_estimate": consistency_estimate,
+        "view_diversity_estimate": view_diversity,
         "approved": approved,
         "warnings": warnings,
         "rejected": rejected,
@@ -172,5 +208,5 @@ def validate_project(db: Session, project: Project) -> dict:
         "real_reconstruction_ready": usable >= MINIMUM_AI_IMAGES,
         "next_capture_suggestion": next_capture_suggestion(usable),
         "photogrammetry_trackability": trackability,
-        **capture_metrics(usable, score, trackability["level"]),
+        **capture_metrics(usable, score, trackability["level"], project.project_type),
     }

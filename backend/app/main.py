@@ -1,21 +1,139 @@
 import shutil
-import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, Depends, File, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 from .config import settings
-from .database import Base, engine, get_db
-from .models import Artifact, Project, ProjectImage, ReconstructionJob, ReconstructionStage
-from .schemas import ProjectCreate, ProjectPatch, ProjectOut, ImageOut, JobOut, ArtifactOut
+from .database import SessionLocal, get_db, migrate_database
+from .models import Artifact, Project, ProjectImage, ReconstructionJob, ReconstructionStage, ReconstructionVersion
+from .schemas import ProjectCreate, ProjectPatch, ProjectOut, ImageOut, JobOut, ArtifactOut, VersionOut
 from .validation import photogrammetry_trackability, validate_project
-from .reconstruction import STAGES, queue_job, reconstruction_engine_status
-from .strategy import MINIMUM_AI_IMAGES, RECOMMENDED_AI_IMAGES, capture_metrics, next_capture_suggestion, strategy_for_images
+from .reconstruction import STAGES, _render_model_preview, queue_job, reconstruction_engine_status
+from .strategy import MINIMUM_AI_IMAGES, RECOMMENDED_AI_IMAGES, capture_metrics, next_capture_suggestion, strategy_for_project
+from .uploads import cleanup_orphaned_temporary_uploads, prepare_image_upload, remove_prepared_upload
+from .diagnostics import system_diagnostics
 
-app = FastAPI(title="ImageTo3D Studio API", version="0.1.0")
+
+def backfill_legacy_versions() -> None:
+    """Attach pre-versioning jobs and artifacts to immutable version records."""
+    with SessionLocal() as db:
+        projects = db.scalars(select(Project)).all()
+        changed = False
+        for project in projects:
+            image_ids = [image.id for image in project.images]
+            primary_image = next((image.id for image in project.images if image.is_primary), None)
+            next_number = (db.scalar(select(func.max(ReconstructionVersion.number)).where(
+                ReconstructionVersion.project_id == project.id,
+            )) or 0) + 1
+            legacy_jobs = db.scalars(select(ReconstructionJob).where(
+                ReconstructionJob.project_id == project.id,
+                ReconstructionJob.version_id.is_(None),
+            ).order_by(ReconstructionJob.created_at, ReconstructionJob.started_at)).all()
+            for job in legacy_jobs:
+                configuration = job.configuration or {}
+                version = ReconstructionVersion(
+                    project_id=project.id,
+                    number=next_number,
+                    status=job.status,
+                    engine=str(configuration.get("engine") or settings.reconstruction_mode),
+                    reconstruction_type=project.project_type,
+                    image_ids=image_ids,
+                    primary_image_id=primary_image,
+                    configuration=configuration,
+                    metrics=job.metrics or {},
+                    warnings=[job.error_message] if job.error_message else [],
+                    logs_path=job.logs_path,
+                    created_at=job.created_at or job.started_at or project.created_at,
+                    completed_at=job.completed_at,
+                )
+                db.add(version)
+                db.flush()
+                job.version_id = version.id
+                for artifact in db.scalars(select(Artifact).where(Artifact.job_id == job.id)):
+                    artifact.version_id = version.id
+                next_number += 1
+                changed = True
+
+            if not project.primary_version_id:
+                primary = db.scalar(select(ReconstructionVersion).where(
+                    ReconstructionVersion.project_id == project.id,
+                    ReconstructionVersion.status == "completed",
+                ).order_by(ReconstructionVersion.number.desc()))
+                if primary:
+                    primary.is_primary = True
+                    project.primary_version_id = primary.id
+                    project.status = "completed"
+                    project.quality_score = (primary.metrics or {}).get("quality_score", project.quality_score)
+                    changed = True
+
+            glb_artifacts = db.scalars(select(Artifact).where(
+                Artifact.project_id == project.id,
+                Artifact.artifact_type == "glb",
+                Artifact.version_id.is_not(None),
+            )).all()
+            for glb in glb_artifacts:
+                preview = db.scalar(select(Artifact).where(
+                    Artifact.version_id == glb.version_id,
+                    Artifact.artifact_type == "preview",
+                ))
+                source = Path(glb.storage_path)
+                if not source.is_file() or (
+                    preview and (preview.artifact_metadata or {}).get("renderer") == "software-v2"
+                ):
+                    continue
+                preview_path = source.with_name(f"{glb.job_id}-preview.jpg")
+                try:
+                    _render_model_preview(source, preview_path)
+                except Exception:
+                    preview_path.unlink(missing_ok=True)
+                    continue
+                if preview:
+                    preview.storage_path = str(preview_path)
+                    preview.file_size = preview_path.stat().st_size
+                    preview.artifact_metadata = {"renderer": "software-v2", "source": "glb", "backfilled": True}
+                else:
+                    db.add(Artifact(
+                        project_id=project.id,
+                        job_id=glb.job_id,
+                        version_id=glb.version_id,
+                        artifact_type="preview",
+                        filename="pre-visualizacao.jpg",
+                        storage_path=str(preview_path),
+                        mime_type="image/jpeg",
+                        file_size=preview_path.stat().st_size,
+                        artifact_metadata={"renderer": "software-v2", "source": "glb", "backfilled": True},
+                    ))
+                changed = True
+        if changed:
+            db.commit()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    settings.storage_root.mkdir(parents=True, exist_ok=True)
+    cleanup_orphaned_temporary_uploads()
+    migrate_database()
+    backfill_legacy_versions()
+    if settings.queue_mode.lower() == "thread":
+        with SessionLocal() as db:
+            interrupted = db.scalars(select(ReconstructionJob).where(ReconstructionJob.status.in_(["queued", "processing"]))).all()
+            for job in interrupted:
+                job.status = "failed"
+                job.error_message = "O processo local foi interrompido. Podes repetir esta versão em segurança."
+                project = db.get(Project, job.project_id)
+                version = db.get(ReconstructionVersion, job.version_id) if job.version_id else None
+                if project:
+                    project.status = "completed" if project.primary_version_id else "ready"
+                if version:
+                    version.status = "failed"
+                    version.warnings = [job.error_message]
+            db.commit()
+    yield
+
+app = FastAPI(title="Matias 3D Studio API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
@@ -24,12 +142,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup():
-    settings.storage_root.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
 
 
 def project_or_404(db: Session, project_id: str) -> Project:
@@ -41,7 +153,12 @@ def project_or_404(db: Session, project_id: str) -> Project:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "reconstruction": reconstruction_engine_status()}
+    return {"status": "ok", "queue_mode": settings.queue_mode, "reconstruction": reconstruction_engine_status()}
+
+
+@app.get("/api/system/diagnostics")
+def diagnostics():
+    return system_diagnostics()
 
 
 @app.get("/api/reconstruction/engine")
@@ -66,6 +183,27 @@ def get_project(project_id: str, db: Session = Depends(get_db)):
     return project_or_404(db, project_id)
 
 
+@app.get("/api/projects/{project_id}/preview")
+def project_preview(project_id: str, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
+    preview_query = select(Artifact).where(
+        Artifact.project_id == project_id,
+        Artifact.artifact_type == "preview",
+    )
+    if project.primary_version_id:
+        preview_query = preview_query.where(Artifact.version_id == project.primary_version_id)
+    preview = db.scalar(preview_query.order_by(Artifact.created_at.desc()))
+    if preview and Path(preview.storage_path).is_file():
+        return FileResponse(preview.storage_path, media_type=preview.mime_type)
+    image = db.scalar(select(ProjectImage).where(
+        ProjectImage.project_id == project_id,
+        ProjectImage.is_primary.is_(True),
+    )) or db.scalar(select(ProjectImage).where(ProjectImage.project_id == project_id).order_by(ProjectImage.created_at))
+    if not image or not Path(image.thumbnail_path).is_file():
+        raise HTTPException(404, "Este projeto ainda não tem pré-visualização.")
+    return FileResponse(image.thumbnail_path, media_type="image/jpeg")
+
+
 @app.patch("/api/projects/{project_id}", response_model=ProjectOut)
 def patch_project(project_id: str, body: ProjectPatch, db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
@@ -84,28 +222,37 @@ def delete_project(project_id: str, db: Session = Depends(get_db)):
 async def upload_images(project_id: str, files: list[UploadFile] = File(...), db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
     if project.image_count + len(files) > settings.max_images: raise HTTPException(400, f"Limite de {settings.max_images} imagens excedido.")
-    output = settings.storage_root / project.id / "originals"; thumbs = settings.storage_root / project.id / "thumbnails"
-    output.mkdir(parents=True, exist_ok=True); thumbs.mkdir(parents=True, exist_ok=True)
+    prepared = []
     created = []
-    for upload in files:
-        if upload.content_type not in {"image/jpeg", "image/png"}: raise HTTPException(415, f"Formato inválido: {upload.filename}")
-        data = await upload.read()
-        if len(data) > settings.max_image_mb * 1024 * 1024: raise HTTPException(413, f"Ficheiro demasiado grande: {upload.filename}")
-        image_id = str(uuid.uuid4()); ext = ".jpg" if upload.content_type == "image/jpeg" else ".png"
-        path = output / f"{image_id}{ext}"; path.write_bytes(data)
-        try:
-            with Image.open(path) as im:
-                im.verify()
-            with Image.open(path) as im:
-                width, height = im.size
-                thumb_path = thumbs / f"{image_id}.jpg"
-                ImageOps.exif_transpose(im).convert("RGB").thumbnail((480, 360)); im = ImageOps.exif_transpose(im).convert("RGB"); im.thumbnail((480, 360)); im.save(thumb_path, "JPEG", quality=82)
-        except Exception:
-            path.unlink(missing_ok=True); raise HTTPException(400, f"Imagem corrompida: {upload.filename}")
-        item = ProjectImage(id=image_id, project_id=project.id, original_filename=Path(upload.filename or "image").name, storage_path=str(path), thumbnail_path=str(thumb_path), mime_type=upload.content_type, width=width, height=height, file_size=len(data))
-        db.add(item); created.append(item)
-    project.image_count += len(created); project.status = "uploading"; db.commit()
-    return created
+    has_primary = any(image.is_primary for image in project.images)
+    try:
+        for upload in files:
+            stored = await prepare_image_upload(project.id, upload)
+            prepared.append(stored)
+            item = ProjectImage(
+                id=stored.image_id,
+                project_id=project.id,
+                original_filename=stored.original_filename,
+                storage_path=str(stored.storage_path),
+                thumbnail_path=str(stored.thumbnail_path),
+                mime_type=stored.mime_type,
+                width=stored.width,
+                height=stored.height,
+                file_size=stored.file_size,
+                is_primary=not has_primary and not created,
+            )
+            db.add(item)
+            created.append(item)
+        project.image_count += len(created)
+        project.status = "uploading"
+        project.validation_score = None
+        db.commit()
+        return created
+    except Exception:
+        db.rollback()
+        for item in prepared:
+            remove_prepared_upload(item)
+        raise
 
 
 @app.get("/api/projects/{project_id}/images", response_model=list[ImageOut])
@@ -126,7 +273,25 @@ def delete_image(project_id: str, image_id: str, db: Session = Depends(get_db)):
     project = project_or_404(db, project_id); item = db.get(ProjectImage, image_id)
     if not item or item.project_id != project_id: raise HTTPException(404, "Imagem não encontrada.")
     Path(item.storage_path).unlink(missing_ok=True); Path(item.thumbnail_path).unlink(missing_ok=True)
-    db.delete(item); project.image_count = max(0, project.image_count - 1); project.validation_score = None; db.commit()
+    was_primary = item.is_primary
+    db.delete(item); project.image_count = max(0, project.image_count - 1); project.validation_score = None
+    if was_primary:
+        replacement = db.scalar(select(ProjectImage).where(ProjectImage.project_id == project.id, ProjectImage.id != image_id).order_by(ProjectImage.created_at))
+        if replacement:
+            replacement.is_primary = True
+    db.commit()
+
+
+@app.post("/api/projects/{project_id}/images/{image_id}/primary", response_model=ImageOut)
+def set_primary_image(project_id: str, image_id: str, db: Session = Depends(get_db)):
+    project_or_404(db, project_id)
+    item = db.get(ProjectImage, image_id)
+    if not item or item.project_id != project_id:
+        raise HTTPException(404, "Imagem não encontrada.")
+    for image in db.scalars(select(ProjectImage).where(ProjectImage.project_id == project_id)):
+        image.is_primary = image.id == image_id
+    db.commit()
+    return item
 
 
 @app.post("/api/projects/{project_id}/validate")
@@ -154,8 +319,14 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
         messages.append("Objeto liso: adequado para IA multivista, mas pouco fiável para fotogrametria clássica.")
     if project.error_message and "multi-vista" in project.error_message:
         messages.append(project.error_message)
+    consistency_values = [image.consistency_score for image in items if image.consistency_score is not None and image.validation_status != "rejected"]
+    technical_score = round((approved + warnings * 0.72) / max(1, len(items)) * 100)
     return {
         "score": project.validation_score,
+        "capture_preparation_score": project.validation_score,
+        "input_quality_score": technical_score,
+        "structural_consistency_estimate": round(sum(consistency_values) / len(consistency_values)) if consistency_values else 0,
+        "view_diversity_estimate": min(100, round(usable / 10 * 100)),
         "approved": approved,
         "warnings": warnings,
         "rejected": rejected,
@@ -165,13 +336,17 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
         "real_reconstruction_ready": usable >= MINIMUM_AI_IMAGES,
         "next_capture_suggestion": next_capture_suggestion(usable),
         "photogrammetry_trackability": trackability,
-        **capture_metrics(usable, project.validation_score, trackability["level"]),
+        **capture_metrics(usable, project.validation_score, trackability["level"], project.project_type),
         "images": [ImageOut.model_validate(item) for item in items],
     }
 
 
 @app.post("/api/projects/{project_id}/reconstruct", response_model=JobOut, status_code=202)
-def reconstruct(project_id: str, db: Session = Depends(get_db)):
+def reconstruct(
+    project_id: str,
+    quality_profile: str = Query("standard", pattern="^(preview|standard|high)$"),
+    db: Session = Depends(get_db),
+):
     project = project_or_404(db, project_id)
     if project.image_count < 1 or project.validation_score is None: raise HTTPException(409, "Valida as imagens antes de iniciar.")
     engine = reconstruction_engine_status()
@@ -186,15 +361,39 @@ def reconstruct(project_id: str, db: Session = Depends(get_db)):
     active = db.scalar(select(ReconstructionJob).where(ReconstructionJob.project_id == project.id, ReconstructionJob.status.in_(["queued", "processing"])))
     if active: raise HTTPException(409, "Já existe uma reconstrução ativa.")
     trackability = photogrammetry_trackability(project.images)
-    strategy = strategy_for_images(usable_images, trackability["level"])
+    strategy = strategy_for_project(project.project_type, usable_images, trackability["level"])
+    image_ids = [image.id for image in project.images if image.validation_status != "rejected"]
+    primary_image = next((image for image in project.images if image.is_primary), None)
+    version_number = (db.scalar(select(func.max(ReconstructionVersion.number)).where(ReconstructionVersion.project_id == project.id)) or 0) + 1
+    profile_settings = {
+        "preview": {"target_faces": 25000, "label": "Pré-visualização rápida"},
+        "standard": {"target_faces": 60000, "label": "Equilibrado"},
+        "high": {"target_faces": 120000, "label": "Alta qualidade"},
+    }[quality_profile]
+    configuration = {
+        "mode": settings.reconstruction_mode,
+        "pipeline_version": "adaptive-ai-v2",
+        "strategy": strategy.as_dict(),
+        "photogrammetry_trackability": trackability,
+        "project_type": project.project_type,
+        "category": project.category,
+        "quality_profile": quality_profile,
+        **profile_settings,
+    }
+    version = ReconstructionVersion(
+        project_id=project.id,
+        number=version_number,
+        reconstruction_type=project.project_type,
+        image_ids=image_ids,
+        primary_image_id=primary_image.id if primary_image else None,
+        configuration=configuration,
+    )
+    db.add(version)
+    db.flush()
     job = ReconstructionJob(
         project_id=project.id,
-        configuration={
-            "mode": settings.reconstruction_mode,
-            "pipeline_version": "adaptive-ai-v2",
-            "strategy": strategy.as_dict(),
-            "photogrammetry_trackability": trackability,
-        },
+        version_id=version.id,
+        configuration=configuration,
     )
     db.add(job); db.flush()
     for i, name in enumerate(STAGES, 1): db.add(ReconstructionStage(job_id=job.id, name=name, order=i))
@@ -206,16 +405,74 @@ def reconstruct(project_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/projects/{project_id}/reconstruct/retry", response_model=JobOut, status_code=202)
 def retry(project_id: str, db: Session = Depends(get_db)):
-    return reconstruct(project_id, db)
+    return reconstruct(project_id, "standard", db)
 
 
 @app.get("/api/projects/{project_id}/job", response_model=JobOut)
 def get_job(project_id: str, db: Session = Depends(get_db)):
     project_or_404(db, project_id)
-    job = db.scalar(select(ReconstructionJob).options(selectinload(ReconstructionJob.stages)).where(ReconstructionJob.project_id == project_id).order_by(ReconstructionJob.started_at.desc()))
+    job = db.scalar(select(ReconstructionJob).options(selectinload(ReconstructionJob.stages)).where(ReconstructionJob.project_id == project_id).order_by(ReconstructionJob.created_at.desc(), ReconstructionJob.started_at.desc()))
     if not job: raise HTTPException(404, "Ainda não existe reconstrução.")
     job.stages.sort(key=lambda x: x.order)
     return job
+
+
+@app.post("/api/projects/{project_id}/job/cancel", response_model=JobOut)
+def cancel_job(project_id: str, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
+    job = db.scalar(select(ReconstructionJob).options(selectinload(ReconstructionJob.stages)).where(
+        ReconstructionJob.project_id == project_id,
+        ReconstructionJob.status.in_(["queued", "processing"]),
+    ).order_by(ReconstructionJob.created_at.desc()))
+    if not job:
+        raise HTTPException(409, "Não existe uma reconstrução ativa.")
+    job.status = "cancelled"
+    project.status = "completed" if project.primary_version_id else "ready"
+    version = db.get(ReconstructionVersion, job.version_id) if job.version_id else None
+    if version:
+        version.status = "cancelled"
+    db.commit()
+    return job
+
+
+@app.get("/api/projects/{project_id}/versions", response_model=list[VersionOut])
+def list_versions(project_id: str, db: Session = Depends(get_db)):
+    project_or_404(db, project_id)
+    return db.scalars(select(ReconstructionVersion).where(ReconstructionVersion.project_id == project_id).order_by(ReconstructionVersion.number.desc())).all()
+
+
+@app.get("/api/projects/{project_id}/versions/{version_id}", response_model=VersionOut)
+def get_version(project_id: str, version_id: str, db: Session = Depends(get_db)):
+    version = db.get(ReconstructionVersion, version_id)
+    if not version or version.project_id != project_id:
+        raise HTTPException(404, "Versão não encontrada.")
+    return version
+
+
+@app.post("/api/projects/{project_id}/versions/{version_id}/primary", response_model=VersionOut)
+def set_primary_version(project_id: str, version_id: str, db: Session = Depends(get_db)):
+    project = project_or_404(db, project_id)
+    version = db.get(ReconstructionVersion, version_id)
+    if not version or version.project_id != project_id or version.status != "completed":
+        raise HTTPException(409, "Só uma versão concluída pode ser definida como principal.")
+    for candidate in db.scalars(select(ReconstructionVersion).where(ReconstructionVersion.project_id == project_id)):
+        candidate.is_primary = candidate.id == version_id
+    project.primary_version_id = version_id
+    project.quality_score = version.metrics.get("quality_score")
+    db.commit()
+    return version
+
+
+@app.get("/api/projects/{project_id}/versions/compare/{left_id}/{right_id}")
+def compare_versions(project_id: str, left_id: str, right_id: str, db: Session = Depends(get_db)):
+    versions = db.scalars(select(ReconstructionVersion).where(
+        ReconstructionVersion.project_id == project_id,
+        ReconstructionVersion.id.in_([left_id, right_id]),
+    )).all()
+    if len(versions) != 2:
+        raise HTTPException(404, "Uma das versões não foi encontrada.")
+    by_id = {version.id: VersionOut.model_validate(version) for version in versions}
+    return {"left": by_id[left_id], "right": by_id[right_id]}
 
 
 @app.get("/api/projects/{project_id}/artifacts", response_model=list[ArtifactOut])

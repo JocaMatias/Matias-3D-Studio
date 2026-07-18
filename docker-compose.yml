@@ -13,6 +13,8 @@ services:
       DATABASE_URL: postgresql+psycopg://studio:studio@postgres:5432/studio
       STORAGE_ROOT: /storage
       RECONSTRUCTION_MODE: ${RECONSTRUCTION_MODE:-mock}
+      QUEUE_MODE: rq
+      REDIS_URL: redis://redis:6379/0
       FRONTEND_ORIGIN: http://localhost:3000
     volumes: ["studio_storage:/storage"]
     depends_on:
@@ -20,11 +22,14 @@ services:
       redis: {condition: service_started}
   worker:
     build: ./backend
-    command: ["python", "-c", "import time; print('Worker reservado para Celery/Redis no modo distribuído'); time.sleep(1000000)"]
+    command: ["python", "-m", "app.worker"]
     environment:
       DATABASE_URL: postgresql+psycopg://studio:studio@postgres:5432/studio
       STORAGE_ROOT: /storage
       RECONSTRUCTION_MODE: ${RECONSTRUCTION_MODE:-mock}
+      QUEUE_MODE: rq
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: matias-3d
     volumes: ["studio_storage:/storage"]
     depends_on: [postgres, redis]
   postgres:

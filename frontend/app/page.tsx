@@ -1,2 +1,32 @@
-import Link from "next/link"; import { ArrowRight, Camera, Cuboid, Download, Images, ScanLine } from "lucide-react";
-export default function Home(){return <main><section className="shell hero"><div><div className="eyebrow">IA multivista · das fotos ao GLB</div><h1>Transforma fotografias num modelo 3D.</h1><p>Começa com cinco imagens. A IA estima as zonas ocultas e cada fotografia adicional melhora a fidelidade e a confiança geométrica.</p><div className="actions"><Link className="btn primary" href="/projects/new">Criar novo projeto <ArrowRight size={17}/></Link><Link className="btn" href="/projects">Ver projetos</Link></div></div><div className="hero-card"><div className="scan"/><div className="orb"/><div className="mini-stat"><span>● IA multivista ativa</span><span>Mais vistas, maior precisão</span></div></div></section><section className="shell section" id="guide"><div className="eyebrow">Como funciona</div><h2 className="section-title">Da captura ao modelo em três passos.</h2><p className="sub">Cinco vistas desbloqueiam a IA; imagens adicionais reduzem as zonas estimadas.</p><div className="grid3"><article className="card"><div className="iconbox"><Images/></div><h3>1. Captura 5–10 vistas</h3><p className="sub">Frente, traseira, lados e uma vista superior são um excelente início.</p></article><article className="card"><div className="iconbox"><ScanLine/></div><h3>2. IA analisa e reconstrói</h3><p className="sub">Isolamos o objeto, escolhemos as melhores vistas e estimamos a forma completa.</p></article><article className="card"><div className="iconbox"><Cuboid/></div><h3>3. Refina e exporta</h3><p className="sub">Adiciona novos ângulos para melhorar o resultado e descarrega o GLB.</p></article></div></section><section className="shell section"><div className="card row"><div><div className="eyebrow">Antes de começares</div><h2 style={{marginBottom:6}}>5–10 imagens é a faixa recomendada.</h2><p className="sub">Evita flash e reflexos, mantém o objeto centrado e cobre ângulos claramente diferentes.</p></div><Camera size={60} color="var(--mint)"/></div></section></main>}
+import Image from "next/image";
+import Link from "next/link";
+import { ArrowRight, FolderOpen } from "lucide-react";
+
+export default function Home() {
+  return (
+    <main className="shell home">
+      <section className="home-center" aria-labelledby="home-title">
+        <div className="home-mark-wrap">
+          <div className="home-glow" />
+          <Image
+            className="home-mark"
+            src="/brand/matias-mark-light.svg"
+            width={500}
+            height={500}
+            alt=""
+            priority
+          />
+        </div>
+        <h1 id="home-title">Matias <span>3D</span> Studio</h1>
+        <nav className="home-actions" aria-label="Começar no Matias 3D Studio">
+          <Link className="btn primary" href="/projects/new">
+            Criar novo projeto <ArrowRight size={17} />
+          </Link>
+          <Link className="btn" href="/projects">
+            <FolderOpen size={17} /> Ver projetos
+          </Link>
+        </nav>
+      </section>
+    </main>
+  );
+}

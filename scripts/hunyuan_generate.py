@@ -1,9 +1,11 @@
-"""Isolated, GPU-efficient Hunyuan3D multiview worker.
+"""Isolated, GPU-efficient Hunyuan3D multiview shape and texture worker.
 
 The worker keeps the diffusion model loaded while it generates multiple shape
 candidates.  It scores their proportions against the input silhouettes, keeps
 the best one, decimates it for real-time display, and exports an honest PBR
-material.  Source photographs are deliberately not projected as vertex colour.
+material. When enabled, Hunyuan Paint creates a coherent UV texture from the
+selected views; if the texture model is unavailable, a neutral PBR fallback is
+exported without pasting a rectangular photograph onto the mesh.
 """
 
 import argparse
@@ -25,6 +27,8 @@ def parse_args():
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--candidates", type=int, default=3)
     parser.add_argument("--target-faces", type=int, default=60000)
+    parser.add_argument("--texture", action="store_true")
+    parser.add_argument("--texture-model")
     return parser.parse_args()
 
 
@@ -191,7 +195,7 @@ def optimize_mesh(mesh, target_faces: int):
 
 def apply_pbr_material(mesh, base_colour: np.ndarray):
     material = trimesh.visual.material.PBRMaterial(
-        name="AI PBR ceramic",
+        name="AI PBR material",
         baseColorFactor=base_colour,
         metallicFactor=0.0,
         roughnessFactor=0.34,
@@ -264,7 +268,34 @@ def main():
     optimized_components = best_mesh.split(only_watertight=False)
     optimized_main = max(optimized_components, key=lambda component: len(component.faces))
     handle_preserved = bool(optimized_main.is_watertight and optimized_main.euler_number <= 0)
-    best_mesh = apply_pbr_material(best_mesh, base_colour)
+    material_mode = "pbr_uniform"
+    if args.texture:
+        try:
+            if not args.texture_model:
+                raise RuntimeError("O modelo local de textura não foi indicado.")
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+            from hy3dgen.texgen import Hunyuan3DPaintPipeline
+
+            paint = Hunyuan3DPaintPipeline.from_pretrained(
+                args.texture_model,
+                subfolder="hunyuan3d-paint-v2-0-turbo",
+            )
+            # Texture generation normally targets 16 GB VRAM. Sequential CPU
+            # offload keeps it viable on common 8 GB laptop GPUs at the cost of
+            # additional time, while the surrounding worker remains responsive.
+            paint.enable_model_cpu_offload()
+            best_mesh = paint(best_mesh, image=images[:4])
+            material_mode = "hunyuan_paint_multiview"
+            del paint
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as error:
+            print(f"HUNYUAN_TEXTURE_WARNING {error}", flush=True)
+            best_mesh = apply_pbr_material(best_mesh, base_colour)
+    else:
+        best_mesh = apply_pbr_material(best_mesh, base_colour)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     best_mesh.export(output)
@@ -278,7 +309,7 @@ def main():
         "handle_expected": handle_expected,
         "handle_preserved": handle_preserved,
         "base_color": [int(value) for value in base_colour],
-        "material": "pbr_uniform",
+        "material": material_mode,
         "output": str(output),
     }
     print(f"HUNYUAN_RESULT {json.dumps(result, separators=(',', ':'))}", flush=True)

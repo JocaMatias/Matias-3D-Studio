@@ -29,7 +29,7 @@ def test_vertical_project_flow():
         settings.mock_stage_seconds = 0.01
         started = client.post(f"/api/projects/{project_id}/reconstruct")
         assert started.status_code == 202
-        for _ in range(50):
+        for _ in range(150):
             job = client.get(f"/api/projects/{project_id}/job").json()
             if job["status"] == "completed":
                 break
@@ -37,4 +37,15 @@ def test_vertical_project_flow():
         assert job["status"] == "completed"
         assert job["progress"] == 100
         artifacts = client.get(f"/api/projects/{project_id}/artifacts").json()
-        assert artifacts[0]["artifact_type"] == "glb"
+        glb = next(artifact for artifact in artifacts if artifact["artifact_type"] == "glb")
+        assert any(artifact["artifact_type"] == "preview" for artifact in artifacts)
+        versions = client.get(f"/api/projects/{project_id}/versions").json()
+        assert len(versions) == 1
+        assert versions[0]["status"] == "completed"
+        assert glb["version_id"] == versions[0]["id"]
+        project = client.get(f"/api/projects/{project_id}").json()
+        assert project["primary_version_number"] == 1
+        preview = client.get(f"/api/projects/{project_id}/preview")
+        assert preview.status_code == 200
+        assert preview.headers["content-type"].startswith("image/jpeg")
+        client.delete(f"/api/projects/{project_id}")

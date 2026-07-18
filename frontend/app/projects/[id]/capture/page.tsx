@@ -2,9 +2,8 @@
 
 import { ChangeEvent, DragEvent, useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Camera, CheckCircle, Cpu, Trash2, Upload } from "lucide-react";
+import { Camera, CheckCircle, Cpu, Star, Trash2, Upload } from "lucide-react";
 import { API, Engine, Project, ProjectImage, request } from "@/lib/api";
-import styles from "./capture.module.css";
 
 type Report = {
   score: number | null;
@@ -23,6 +22,9 @@ type Report = {
   visual_fidelity_estimate?: number;
   geometric_confidence_estimate?: number;
   observed_coverage_estimate?: number;
+  input_quality_score?: number;
+  structural_consistency_estimate?: number;
+  view_diversity_estimate?: number;
   next_capture_suggestion?: string;
   photogrammetry_trackability?: {
     level: string;
@@ -53,6 +55,9 @@ function normalizeReport(
     visual_fidelity_estimate: value?.visual_fidelity_estimate,
     geometric_confidence_estimate: value?.geometric_confidence_estimate,
     observed_coverage_estimate: value?.observed_coverage_estimate,
+    input_quality_score: value?.input_quality_score,
+    structural_consistency_estimate: value?.structural_consistency_estimate,
+    view_diversity_estimate: value?.view_diversity_estimate,
     next_capture_suggestion: value?.next_capture_suggestion,
     photogrammetry_trackability: value?.photogrammetry_trackability,
   };
@@ -66,6 +71,7 @@ export default function Capture() {
   const [engine, setEngine] = useState<Engine>();
   const [busy, setBusy] = useState(false);
   const [drag, setDrag] = useState(false);
+  const [qualityProfile, setQualityProfile] = useState("standard");
   const [report, setReport] = useState<Report | null>(null);
   const [error, setError] = useState("");
 
@@ -110,6 +116,11 @@ export default function Capture() {
     setReport(null);
   }
 
+  async function setPrimary(imageId: string) {
+    await request(`/api/projects/${id}/images/${imageId}/primary`, { method: "POST" });
+    await load();
+  }
+
   async function validate() {
     setBusy(true);
     setError("");
@@ -128,7 +139,7 @@ export default function Capture() {
     setBusy(true);
     setError("");
     try {
-      await request(`/api/projects/${id}/reconstruct`, { method: "POST" });
+      await request(`/api/projects/${id}/reconstruct?quality_profile=${qualityProfile}`, { method: "POST" });
       router.push(`/projects/${id}/processing`);
     } catch (reconstructionError) {
       setError((reconstructionError as Error).message);
@@ -150,12 +161,12 @@ export default function Capture() {
   );
 
   return (
-    <main className={`${styles.capturePage} shell`}>
+    <main className="capture-page shell">
       <div className="pagehead">
         <div>
           <div className="eyebrow">Captura · {project?.name}</div>
           <h1>Adiciona as fotografias</h1>
-          <p className="sub">JPG ou PNG · 5–10 imagens recomendadas · mais vistas, maior precisão</p>
+          <p className="sub">JPG ou PNG · 5–10 imagens para começar · mais vistas úteis aumentam a precisão</p>
         </div>
         <span className="badge">{images.length} imagens carregadas</span>
       </div>
@@ -184,8 +195,9 @@ export default function Capture() {
             {images.map((image) => (
               <div className="image" key={image.id} title={(image.validation_messages ?? []).join("\n")}>
                 <img src={`${API}/api/projects/${id}/images/${image.id}/thumbnail`} alt={image.original_filename} />
-                <button onClick={() => void remove(image.id)}><Trash2 size={15} /></button>
-                {image.validation_status !== "pending" && <span className="flag">{image.validation_status}</span>}
+                <button type="button" onClick={() => void remove(image.id)} title="Remover"><Trash2 size={15} /></button>
+                <button type="button" style={{ left: 7, right: "auto", color: image.is_primary ? "var(--mint)" : "white" }} onClick={() => void setPrimary(image.id)} title="Definir como referência principal"><Star size={15} fill={image.is_primary ? "currentColor" : "none"} /></button>
+                <span className="flag">{image.is_primary ? "principal" : image.validation_status !== "pending" ? image.validation_status : "por validar"}</span>
               </div>
             ))}
           </div>
@@ -194,11 +206,11 @@ export default function Capture() {
         <aside>
           <div className="card">
             <Camera color="var(--mint)" />
-            <h3>Para um bom modelo com 5–10 fotos</h3>
+            <h3>{project?.project_type === "ai_references" ? "Referências IA consistentes" : project?.project_type === "hybrid" ? "Captura híbrida coerente" : "Para um bom modelo com 5–10 fotos"}</h3>
             <ul className="checklist">
-              <li>Frente, traseira, esquerda e direita</li>
+              <li>{project?.project_type === "ai_references" ? "Marca com a estrela a vista que define o objeto" : "Frente, traseira, esquerda e direita"}</li>
               <li>Uma vista ligeiramente superior</li>
-              <li>Luz suave; desliga o flash</li>
+              <li>{project?.project_type === "ai_references" ? "Mantém proporções, materiais e detalhes idênticos" : "Luz suave; desliga o flash"}</li>
               <li>Distância e zoom constantes</li>
               <li>Objeto completo e centrado em todas</li>
               <li>Fotos adicionais refinam zonas ocultas</li>
@@ -218,18 +230,33 @@ export default function Capture() {
               <p>Preparação da captura</p>
               <p className="sub">{report.approved} aprovadas · {report.warnings} avisos · {report.rejected} rejeitadas</p>
               {report.pipeline && (
-                <div className={styles.strategy}>
+                <div className="strategy">
                   <span className="badge">{report.pipeline.label}</span>
                   <p className="sub">{report.pipeline.description}</p>
                 </div>
               )}
               {report.photogrammetry_trackability && (
-                <div className={styles.strategy}>
+                <div className="strategy">
                   <span className="badge">Textura rastreável: {report.photogrammetry_trackability.label}</span>
                   <p className="sub">{report.photogrammetry_trackability.reason}</p>
                 </div>
               )}
-              <div className={styles.metrics}>
+              <div className="metrics">
+                <div>
+                  <span>Qualidade das imagens</span>
+                  <strong>{report.input_quality_score ?? report.score ?? 0}%</strong>
+                  <i><b style={{ width: `${report.input_quality_score ?? report.score ?? 0}%` }} /></i>
+                </div>
+                <div>
+                  <span>Consistência entre vistas</span>
+                  <strong>{report.structural_consistency_estimate ?? 0}%</strong>
+                  <i><b style={{ width: `${report.structural_consistency_estimate ?? 0}%` }} /></i>
+                </div>
+                <div>
+                  <span>Diversidade de ângulos</span>
+                  <strong>{report.view_diversity_estimate ?? 0}%</strong>
+                  <i><b style={{ width: `${report.view_diversity_estimate ?? 0}%` }} /></i>
+                </div>
                 <div>
                   <span>Fidelidade visual</span>
                   <strong>{report.visual_fidelity_estimate ?? 0}%</strong>
@@ -242,7 +269,7 @@ export default function Capture() {
                 </div>
               </div>
               {report.next_capture_suggestion && (
-                <p className={styles.suggestion}><strong>Próxima foto:</strong> {report.next_capture_suggestion}</p>
+                <p className="suggestion"><strong>Próxima foto:</strong> {report.next_capture_suggestion}</p>
               )}
               {report.messages.map((message) => <p className="error" key={message}>{message}</p>)}
             </div>
@@ -251,6 +278,14 @@ export default function Capture() {
           <button className="btn" style={{ width: "100%", marginTop: 14 }} disabled={!images.length || busy} onClick={() => void validate()}>
             <CheckCircle size={17} /> Validar imagens
           </button>
+          <label className="field" style={{ marginTop: 12 }}>
+            <span>Perfil da malha</span>
+            <select className="input" value={qualityProfile} onChange={(event) => setQualityProfile(event.target.value)}>
+              <option value="preview">Pré-visualização · ~25 mil faces</option>
+              <option value="standard">Equilibrado · ~60 mil faces</option>
+              <option value="high">Alta qualidade · ~120 mil faces</option>
+            </select>
+          </label>
           <button className="btn primary" style={{ width: "100%", marginTop: 10 }} disabled={!canReconstruct || busy} onClick={() => void reconstruct()}>
             {report?.pipeline?.key === "hybrid" ? "Reconstruir em modo híbrido" : "Gerar modelo com IA"}
           </button>

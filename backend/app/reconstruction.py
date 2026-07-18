@@ -12,12 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 from .config import PROJECT_ROOT, settings
 from .database import SessionLocal
-from .models import Artifact, Project, ReconstructionJob
-from .strategy import MINIMUM_AI_IMAGES, capture_metrics, strategy_for_images
+from .models import Artifact, Project, ReconstructionJob, ReconstructionVersion
+from .strategy import MINIMUM_AI_IMAGES, capture_metrics, strategy_for_project
 from .validation import photogrammetry_trackability
 
 STAGES = [
@@ -29,6 +29,10 @@ STAGES = [
     "Aplicar texturas",
     "Exportar GLB",
 ]
+
+_LOCAL_JOB_QUEUE: queue.Queue[str] = queue.Queue()
+_LOCAL_WORKER_LOCK = threading.Lock()
+_LOCAL_WORKER: threading.Thread | None = None
 
 
 def _now():
@@ -121,6 +125,43 @@ def _find_hunyuan_runtime() -> tuple[Path | None, Path | None]:
     return python, generator
 
 
+def _find_hunyuan_texture_model() -> Path | None:
+    """Find a fully local paint snapshot without downloading during a job."""
+    cache = _resolved_tool_root(settings.hunyuan_model_cache)
+    snapshots = cache / "hub" / "models--tencent--Hunyuan3D-2" / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    ordered = sorted(snapshots.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True)
+    for snapshot in ordered:
+        if not snapshot.is_dir():
+            continue
+        delight = snapshot / "hunyuan3d-delight-v2-0"
+        paint = snapshot / "hunyuan3d-paint-v2-0-turbo"
+        if delight.is_dir() and paint.is_dir() and any(delight.rglob("*")) and any(paint.rglob("*")):
+            return snapshot
+    return None
+
+
+def _hunyuan_texture_runtime(python: Path) -> Path | None:
+    """Enable painting only when its model and native rasterizer are ready."""
+    if not settings.enable_ai_texturing:
+        return None
+    model = _find_hunyuan_texture_model()
+    if model is None:
+        return None
+    try:
+        check = subprocess.run(
+            [str(python), "-c", "import custom_rasterizer"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return model if check.returncode == 0 else None
+
+
 def reconstruction_engine_status() -> dict:
     mode = settings.reconstruction_mode.lower()
     if mode == "mock":
@@ -180,7 +221,7 @@ def create_mock_glb(path: Path) -> None:
     indices = struct.pack("<3H", 0, 1, 2) + b"\x00\x00"
     binary = positions + indices
     document = {
-        "asset": {"version": "2.0", "generator": "ImageTo3D Studio test fixture"},
+        "asset": {"version": "2.0", "generator": "Matias 3D Studio test fixture"},
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
@@ -208,8 +249,62 @@ def create_mock_glb(path: Path) -> None:
     )
 
 
-def queue_job(job_id: str) -> None:
-    threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
+class JobCancelled(RuntimeError):
+    pass
+
+
+def _run_local_queue() -> None:
+    while True:
+        job_id = _LOCAL_JOB_QUEUE.get()
+        try:
+            run_job(job_id)
+        finally:
+            _LOCAL_JOB_QUEUE.task_done()
+
+
+def _ensure_local_worker() -> None:
+    global _LOCAL_WORKER
+    with _LOCAL_WORKER_LOCK:
+        if _LOCAL_WORKER is None or not _LOCAL_WORKER.is_alive():
+            _LOCAL_WORKER = threading.Thread(
+                target=_run_local_queue,
+                daemon=True,
+                name="reconstruction-local-worker",
+            )
+            _LOCAL_WORKER.start()
+
+
+def queue_job(job_id: str) -> str:
+    """Queue a reconstruction locally or in Redis without losing the job identity."""
+    if settings.queue_mode.lower() == "rq":
+        from redis import Redis
+        from rq import Queue
+
+        queue_client = Queue(
+            settings.queue_name,
+            connection=Redis.from_url(settings.redis_url),
+            default_timeout=settings.queue_job_timeout_seconds,
+        )
+        queued = queue_client.enqueue(
+            run_job,
+            job_id,
+            job_id=job_id,
+            job_timeout=settings.queue_job_timeout_seconds,
+            result_ttl=86400,
+            failure_ttl=604800,
+        )
+        queue_id = queued.id
+    else:
+        queue_id = f"local:{job_id}"
+        _ensure_local_worker()
+        _LOCAL_JOB_QUEUE.put(job_id)
+
+    with SessionLocal() as db:
+        job = db.get(ReconstructionJob, job_id)
+        if job:
+            job.queue_id = queue_id
+            db.commit()
+    return queue_id
 
 
 def run_job(job_id: str) -> None:
@@ -218,9 +313,15 @@ def run_job(job_id: str) -> None:
     if not job:
         db.close()
         return
+    if job.status == "cancelled":
+        db.close()
+        return
     project = db.get(Project, job.project_id)
+    version = db.get(ReconstructionVersion, job.version_id) if job.version_id else None
     try:
         job.status = project.status = "processing"
+        if version:
+            version.status = "processing"
         job.started_at = _now()
         project.error_message = None
         db.commit()
@@ -230,7 +331,7 @@ def run_job(job_id: str) -> None:
         elif mode == "colmap":
             usable = sum(image.validation_status != "rejected" for image in project.images)
             trackability = photogrammetry_trackability(project.images)
-            strategy = strategy_for_images(usable, trackability["level"])
+            strategy = strategy_for_project(project.project_type, usable, trackability["level"])
             job.configuration = {
                 **(job.configuration or {}),
                 "pipeline_version": "adaptive-ai-v2",
@@ -256,9 +357,25 @@ def run_job(job_id: str) -> None:
                 _run_hunyuan(db, job, project, strategy_key=strategy.key)
         else:
             _run_mock(db, job, project)
+    except JobCancelled as exc:
+        job.status = "cancelled"
+        job.error_message = str(exc)
+        job.completed_at = _now()
+        if version:
+            version.status = "cancelled"
+            version.completed_at = job.completed_at
+            version.warnings = [str(exc)]
+        project.status = "completed" if project.primary_version_id else "ready"
+        db.commit()
     except Exception as exc:
-        job.status = project.status = "failed"
+        job.status = "failed"
+        project.status = "completed" if project.primary_version_id else "failed"
         job.error_message = project.error_message = str(exc)
+        job.completed_at = _now()
+        if version:
+            version.status = "failed"
+            version.completed_at = job.completed_at
+            version.warnings = [str(exc)]
         db.commit()
     finally:
         db.close()
@@ -279,6 +396,9 @@ def _reset_job_for_fallback(db, job):
 
 
 def _advance(db, job, stage, percent: int, message: str):
+    db.refresh(job)
+    if job.status == "cancelled":
+        raise JobCancelled("Reconstrução cancelada pelo utilizador.")
     stage.status = "processing" if percent < 100 else "completed"
     stage.started_at = stage.started_at or _now()
     stage.progress = percent
@@ -294,6 +414,7 @@ def _finish(db, job, project, output: Path, metrics: dict, metadata: dict):
     artifact = Artifact(
         project_id=project.id,
         job_id=job.id,
+        version_id=job.version_id,
         artifact_type="glb",
         filename="modelo-3d.glb",
         storage_path=str(output),
@@ -302,11 +423,44 @@ def _finish(db, job, project, output: Path, metrics: dict, metadata: dict):
         artifact_metadata=metadata,
     )
     db.add(artifact)
+    preview_path = output.with_name(f"{job.id}-preview.jpg")
+    try:
+        _render_model_preview(output, preview_path)
+        db.add(Artifact(
+            project_id=project.id,
+            job_id=job.id,
+            version_id=job.version_id,
+            artifact_type="preview",
+            filename="pre-visualizacao.jpg",
+            storage_path=str(preview_path),
+            mime_type="image/jpeg",
+            file_size=preview_path.stat().st_size,
+            artifact_metadata={"renderer": "software-v2", "source": "glb"},
+        ))
+    except Exception:
+        preview_path.unlink(missing_ok=True)
     job.status = project.status = "completed"
     job.progress = 100
     job.completed_at = project.completed_at = _now()
     job.metrics = metrics
-    project.quality_score = metrics.get("quality_score")
+    version = db.get(ReconstructionVersion, job.version_id) if job.version_id else None
+    if version:
+        version.status = "completed"
+        version.engine = str(metadata.get("engine") or settings.reconstruction_mode)
+        version.metrics = metrics
+        version.configuration = job.configuration or {}
+        version.logs_path = job.logs_path
+        version.completed_at = job.completed_at
+        if job.started_at:
+            started = job.started_at.replace(tzinfo=timezone.utc) if job.started_at.tzinfo is None else job.started_at
+            version.duration_seconds = max(0.0, (job.completed_at - started).total_seconds())
+        if not project.primary_version_id:
+            project.primary_version_id = version.id
+            version.is_primary = True
+        if project.primary_version_id == version.id:
+            project.quality_score = metrics.get("quality_score")
+    else:
+        project.quality_score = metrics.get("quality_score")
     db.commit()
 
 
@@ -333,7 +487,7 @@ def _prepare_images(project: Project, destination: Path) -> int:
     destination.mkdir(parents=True, exist_ok=True)
     valid_images = sorted(
         (image for image in project.images if image.validation_status != "rejected"),
-        key=lambda image: (image.created_at, image.original_filename),
+        key=lambda image: (not image.is_primary, image.created_at, image.original_filename),
     )
     for index, item in enumerate(valid_images):
         output = destination / f"image-{index:04d}.jpg"
@@ -456,6 +610,68 @@ def _convert_to_glb(source: Path, output: Path) -> dict:
     triangles = sum(len(geometry.faces) for geometry in scene.geometry.values())
     output.write_bytes(scene.export(file_type="glb"))
     return {"vertices": vertices, "triangles": triangles}
+
+
+def _render_model_preview(source: Path, output: Path) -> None:
+    """Render a lightweight thumbnail from the actual reconstructed geometry."""
+    import trimesh
+
+    scene = trimesh.load(str(source), force="scene", process=False)
+    if not scene.geometry:
+        raise RuntimeError("A mesh não contém geometria para pré-visualizar.")
+    mesh = scene.to_geometry()
+    if len(mesh.faces) == 0:
+        raise RuntimeError("A mesh não contém faces para pré-visualizar.")
+    if len(mesh.faces) > 25_000:
+        try:
+            mesh = mesh.simplify_quadric_decimation(face_count=25_000)
+        except Exception:
+            # Preview generation must never prevent delivery of the GLB.
+            pass
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    vertices -= (vertices.min(axis=0) + vertices.max(axis=0)) / 2
+    extent = float(np.max(np.ptp(vertices, axis=0)))
+    if extent <= 0:
+        raise RuntimeError("A mesh tem dimensões inválidas.")
+    vertices /= extent
+
+    yaw = np.deg2rad(32.0)
+    pitch = np.deg2rad(-18.0)
+    rotate_y = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
+    rotate_x = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]])
+    vertices = vertices @ (rotate_y @ rotate_x).T
+
+    triangles = vertices[faces]
+    normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    normal_length = np.linalg.norm(normals, axis=1)
+    valid = normal_length > 1e-10
+    triangles = triangles[valid]
+    normals = normals[valid] / normal_length[valid, None]
+    if len(triangles) == 0:
+        raise RuntimeError("A mesh não contém faces visíveis.")
+
+    width, height = 720, 460
+    canvas = Image.new("RGB", (width, height), "#06110f")
+    draw = ImageDraw.Draw(canvas)
+    draw.ellipse((88, 372, width - 88, 425), fill="#0a1d19")
+    screen = np.empty((len(triangles), 3, 2), dtype=np.float64)
+    screen[:, :, 0] = width / 2 + triangles[:, :, 0] * 0.76 * width
+    screen[:, :, 1] = height / 2 - triangles[:, :, 1] * 0.76 * height
+    depth = triangles[:, :, 2].mean(axis=1)
+    light = np.array([-0.35, 0.65, 0.68], dtype=np.float64)
+    light /= np.linalg.norm(light)
+    intensity = np.clip(np.abs(normals @ light) * 0.62 + 0.28, 0.20, 0.96)
+
+    for index in np.argsort(depth):
+        value = int(42 + intensity[index] * 188)
+        colour = (max(30, value - 18), value, max(36, value - 6))
+        points = [(int(x), int(y)) for x, y in screen[index]]
+        draw.polygon(points, fill=colour)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output, "JPEG", quality=88, optimize=True)
 
 
 def _run_meshroom(db, job, project):
@@ -709,21 +925,32 @@ def _run_stage_command(
     output_reader.start()
     started = time.monotonic()
     timeout = timeout_seconds or settings.reconstruction_timeout_hours * 3600
-    while process.poll() is None:
-        while True:
+    try:
+        while process.poll() is None:
+            while True:
+                try:
+                    line = output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                log.write(line)
+                log.flush()
+                tail.append(line.rstrip())
+            if stage.progress < 85:
+                _advance(db, job, stage, min(85, stage.progress + 2), message)
+            else:
+                elapsed_minutes = max(1, round((time.monotonic() - started) / 60))
+                _advance(db, job, stage, 85, f"{message} ({elapsed_minutes} min)")
+            if time.monotonic() - started > timeout:
+                raise RuntimeError(f"A etapa '{stage.name}' excedeu o tempo máximo configurado.")
+            time.sleep(2)
+    finally:
+        if process.poll() is None:
+            process.terminate()
             try:
-                line = output_queue.get_nowait()
-            except queue.Empty:
-                break
-            log.write(line)
-            log.flush()
-            tail.append(line.rstrip())
-        if stage.progress < 90:
-            _advance(db, job, stage, min(90, stage.progress + 2), message)
-        if time.monotonic() - started > timeout:
-            process.kill()
-            raise RuntimeError(f"A etapa '{stage.name}' excedeu o tempo máximo configurado.")
-        time.sleep(2)
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
     output_reader.join(timeout=5)
     while not output_queue.empty():
         line = output_queue.get_nowait()
@@ -883,7 +1110,7 @@ def _mask_handle_hole(mask_path: Path) -> tuple[float, float] | None:
 
 
 def _semantic_handle_order(images: list[Path], masks_dir: Path) -> list[Path] | None:
-    """Map cup-like views to Hunyuan's front/left/back/right slots."""
+    """Map views with a lateral opening to Hunyuan's fixed camera slots."""
     features = []
     for image in images:
         hole = _mask_handle_hole(masks_dir / f"{image.stem}.mask.png")
@@ -987,6 +1214,10 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
 
     candidates = sorted(images_dir.glob("image-*.jpg"))
     selected = _select_conditioning_views(candidates, masks_dir, 4)
+    if project.project_type in {"ai_references", "hybrid"}:
+        primary_path = images_dir / "image-0000.jpg"
+        if primary_path.is_file():
+            selected = [primary_path, *[image for image in selected if image != primary_path]][:4]
     selected_masks = [masks_dir / f"{image.stem}.mask.png" for image in selected]
     if any(not mask.is_file() for mask in selected_masks):
         raise RuntimeError("Não foi possível segmentar vistas suficientes para a reconstrução por IA.")
@@ -997,7 +1228,9 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     raw_output = workspace / "hunyuan-raw.glb"
     model_cache = _resolved_tool_root(settings.hunyuan_model_cache)
     model_cache.mkdir(parents=True, exist_ok=True)
+    texture_model = _hunyuan_texture_runtime(python)
     generated_candidates = 4 if image_count <= 10 else 2
+    target_faces = int((job.configuration or {}).get("target_faces", 60000))
     command = [
         str(python), str(generator),
         "--repo", str(_resolved_tool_root(settings.hunyuan_root)),
@@ -1008,18 +1241,22 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         # need a larger diffusion grid to provide that benefit.
         "--resolution", "256",
         "--candidates", str(generated_candidates),
-        "--target-faces", "60000",
+        "--target-faces", str(target_faces),
         "--images", *[str(image) for image in selected],
         "--masks", *[str(mask) for mask in selected_masks],
     ]
+    if texture_model:
+        command.extend(["--texture", "--texture-model", str(texture_model)])
     job.configuration = {
         **(job.configuration or {}),
         "engine": "Hunyuan3D-2mv Turbo",
         "strategy_key": strategy_key,
         "conditioning_views": [image.name for image in selected],
         "candidate_count": generated_candidates,
-        "target_faces": 60000,
+        "target_faces": target_faces,
         "generative_ai": True,
+        "ai_texturing": bool(texture_model),
+        "ai_texturing_reason": "ready" if texture_model else "native rasterizer or local paint model unavailable",
     }
     db.commit()
     with log_path.open("w", encoding="utf-8") as log:
@@ -1036,7 +1273,9 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     if not raw_output.is_file() or raw_output.stat().st_size < 10_000:
         raise RuntimeError("A IA terminou sem produzir uma malha 3D utilizável.")
     worker_result = _read_hunyuan_result(log_path)
-    _advance(db, job, stages[5], 100, "Material cerâmico PBR aplicado sem projeção fotográfica falsa")
+    material_mode = str(worker_result.get("material", "pbr_uniform"))
+    texture_generated = material_mode == "hunyuan_paint_multiview"
+    _advance(db, job, stages[5], 100, "Textura multivista gerada" if texture_generated else "Material PBR coerente aplicado")
 
     _advance(db, job, stages[6], 20, "A normalizar e exportar o GLB…")
     glb_path = artifacts_dir / f"{job.id}.glb"
@@ -1047,10 +1286,18 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     _advance(db, job, stages[6], 100, "GLB generativo criado e verificado")
 
     trackability = photogrammetry_trackability(project.images)
-    estimates = capture_metrics(image_count, project.validation_score, trackability["level"])
+    estimates = capture_metrics(image_count, project.validation_score, trackability["level"], project.project_type)
     confidence = estimates["geometric_confidence_estimate"]
     if strategy_key == "hybrid_fallback":
-        confidence = max(35, confidence - 10)
+        attempt = (job.configuration or {}).get("photogrammetry_attempt", {})
+        aligned = int(attempt.get("registered", 0) or 0)
+        attempted = int(attempt.get("images", image_count) or image_count)
+        alignment_ratio = aligned / max(1, attempted)
+        # A high input count must not masquerade as geometric proof when the
+        # classical alignment failed. The generative result remains usable but
+        # its confidence is capped by the cameras that were actually recovered.
+        confidence = min(confidence - 10, round(38 + alignment_ratio * 34))
+        confidence = max(30, confidence)
     _finish(
         db,
         job,
@@ -1072,7 +1319,8 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "handle_expected": bool(worker_result.get("handle_expected", False)),
             "handle_preserved": bool(worker_result.get("handle_preserved", False)),
             "triangles_before_optimization": int(worker_result.get("faces_before_optimization", geometry["triangles"])),
-            "texture_mode": "PBR base · sem projeção da fotografia",
+            "texture_mode": "Textura UV multivista" if texture_generated else "PBR base sem textura gerada",
+            "texture_generated": texture_generated,
             "photogrammetry_trackability": trackability["score"],
             "quality_score": estimates["visual_fidelity_estimate"],
         },
@@ -1086,9 +1334,9 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "conditioning_views": len(selected),
             "candidates_generated": int(worker_result.get("candidate_count", generated_candidates)),
             "selected_candidate": int(worker_result.get("selected_candidate", 1)),
-            "material": "PBR uniforme estimado das vistas",
-            "texture_projection": False,
-            "optimized_target_faces": 60000,
+            "material": material_mode,
+            "texture_projection": texture_generated,
+            "optimized_target_faces": target_faces,
             "source_format": ".glb",
         },
     )
@@ -1128,7 +1376,7 @@ def _run_colmap(db, job, project):
     camera_count = _prepare_images(project, images_dir)
     if camera_count < 20:
         raise RuntimeError("O modo fotogramétrico precisa de pelo menos 20 fotografias válidas; com menos imagens usa a reconstrução por IA.")
-    _advance(db, job, stages[0], 35, "A isolar a chávena do fundo com segmentação automática…")
+    _advance(db, job, stages[0], 35, "A isolar o objeto do fundo com segmentação automática…")
     mask_count = _prepare_object_masks(images_dir, masks_dir)
     _advance(db, job, stages[0], 100, f"{camera_count} imagens e {mask_count} máscaras preparadas")
 
@@ -1175,7 +1423,7 @@ def _run_colmap(db, job, project):
         model_dir = sparse_dir / "0"
         if not model_dir.is_dir():
             raise RuntimeError(
-                "Não foi possível alinhar as fotografias da chávena. O flash, as superfícies brancas e a mudança entre posição direita/invertida impediram correspondências suficientes."
+                "Não foi possível alinhar as fotografias do objeto. Reflexos, superfícies uniformes ou mudanças de estado impediram correspondências suficientes."
             )
         _run_stage_command(
             db, job, stages[2],
@@ -1183,6 +1431,16 @@ def _run_colmap(db, job, project):
             "A verificar câmaras reconstruídas…", log, workspace, colmap_env,
         )
         registered, sparse_points = _colmap_model_stats(text_model)
+        job.configuration = {
+            **(job.configuration or {}),
+            "photogrammetry_attempt": {
+                "images": camera_count,
+                "registered": registered,
+                "sparse_points": sparse_points,
+                "alignment_ratio": round(registered / max(1, camera_count), 4),
+            },
+        }
+        db.commit()
         minimum_registered = max(16, int(np.ceil(camera_count * 0.7)))
         if registered < minimum_registered:
             raise RuntimeError(f"Só {registered} de {camera_count} fotografias foram alinhadas. Faz uma nova captura sem flash e com 70–80% de sobreposição.")
