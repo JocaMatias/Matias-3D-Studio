@@ -3,23 +3,30 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
-    ports: ["3000:3000"]
-    depends_on: [backend]
+        NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT:-8000}
+    ports: ["${FRONTEND_PORT:-3000}:3000"]
+    depends_on:
+      backend: {condition: service_healthy}
   backend:
     build: ./backend
-    ports: ["8000:8000"]
+    ports: ["${BACKEND_PORT:-8000}:8000"]
     environment:
       DATABASE_URL: postgresql+psycopg://studio:studio@postgres:5432/studio
       STORAGE_ROOT: /storage
       RECONSTRUCTION_MODE: ${RECONSTRUCTION_MODE:-mock}
       QUEUE_MODE: rq
       REDIS_URL: redis://redis:6379/0
-      FRONTEND_ORIGIN: http://localhost:3000
+      FRONTEND_ORIGIN: http://localhost:${FRONTEND_PORT:-3000}
     volumes: ["studio_storage:/storage"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 10s
     depends_on:
       postgres: {condition: service_healthy}
-      redis: {condition: service_started}
+      redis: {condition: service_healthy}
   worker:
     build: ./backend
     command: ["python", "-m", "app.worker"]
@@ -31,7 +38,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: matias-3d
     volumes: ["studio_storage:/storage"]
-    depends_on: [postgres, redis]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
   postgres:
     image: postgres:16-alpine
     environment: {POSTGRES_USER: studio, POSTGRES_PASSWORD: studio, POSTGRES_DB: studio}
@@ -40,4 +49,5 @@ services:
   redis:
     image: redis:7-alpine
     volumes: ["redis_data:/data"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10}
 volumes: {studio_storage: {}, postgres_data: {}, redis_data: {}}

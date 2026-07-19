@@ -4,8 +4,9 @@ The worker keeps the diffusion model loaded while it generates multiple shape
 candidates.  It scores their proportions against the input silhouettes, keeps
 the best one, decimates it for real-time display, and exports an honest PBR
 material. When enabled, Hunyuan Paint creates a coherent UV texture from the
-selected views; if the texture model is unavailable, a neutral PBR fallback is
-exported without pasting a rectangular photograph onto the mesh.
+selected views; if its native CUDA rasterizer is unavailable, a portable
+multiview UV baker preserves the observed appearance without pasting a
+rectangular photograph onto the mesh.
 """
 
 import argparse
@@ -21,14 +22,17 @@ def parse_args():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--cache", required=True)
-    parser.add_argument("--images", nargs="+", required=True)
-    parser.add_argument("--masks", nargs="+", required=True)
+    parser.add_argument("--manifest")
+    parser.add_argument("--images", nargs="+")
+    parser.add_argument("--masks", nargs="+")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--candidates", type=int, default=3)
     parser.add_argument("--target-faces", type=int, default=60000)
+    parser.add_argument("--category", default="generic")
     parser.add_argument("--texture", action="store_true")
     parser.add_argument("--texture-model")
+    parser.add_argument("--project-colors", action="store_true")
     return parser.parse_args()
 
 
@@ -42,10 +46,22 @@ sys.path.insert(0, str(Path(args.repo).resolve()))
 import numpy as np
 import torch
 import trimesh
-from PIL import Image
+from PIL import Image, ImageDraw
 from scipy.ndimage import label
 
 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
+from mesh_recovery import (
+    build_estimated_proxy,
+    is_usable_topology,
+    repair_candidate,
+    sanitize_mesh,
+    topology_report,
+)
+from mesh_texturing import (
+    apply_multiview_uv_texture,
+    apply_multiview_vertex_colours,
+    apply_pbr_material,
+)
 
 
 def foreground_image(image_path: str, mask_path: str) -> Image.Image:
@@ -56,6 +72,33 @@ def foreground_image(image_path: str, mask_path: str) -> Image.Image:
     rgba = image.convert("RGBA")
     rgba.putalpha(mask)
     return rgba
+
+
+def load_inputs() -> tuple[list[str], list[str], list[list[int]], list[list[str]]]:
+    """Load all validation views plus four-slot conditioning groups."""
+    if args.manifest:
+        manifest = json.loads(Path(args.manifest).read_text(encoding="utf-8"))
+        image_paths = [str(value) for value in manifest.get("images", [])]
+        mask_paths = [str(value) for value in manifest.get("masks", [])]
+        raw_groups = manifest.get("view_groups", [])
+        group_names = manifest.get("view_group_names", [])
+    else:
+        image_paths = [str(value) for value in (args.images or [])]
+        mask_paths = [str(value) for value in (args.masks or [])]
+        raw_groups = [list(range(min(4, len(image_paths))))]
+        group_names = [[Path(image_paths[index]).name for index in raw_groups[0]]] if image_paths else []
+    if not image_paths or len(image_paths) != len(mask_paths):
+        raise RuntimeError("O manifesto multivista não contém pares imagem/máscara válidos.")
+    groups: list[list[int]] = []
+    for raw in raw_groups:
+        group = [int(index) for index in raw if 0 <= int(index) < len(image_paths)][:4]
+        if group and len(group) == len(set(group)) and group not in groups:
+            groups.append(group)
+    if not groups:
+        groups = [list(range(min(4, len(image_paths))))]
+    if not group_names:
+        group_names = [[Path(image_paths[index]).name for index in group] for group in groups]
+    return image_paths, mask_paths, groups, group_names
 
 
 def silhouette_profile(image: Image.Image) -> np.ndarray:
@@ -110,36 +153,180 @@ def expects_handle_topology(images: list[Image.Image]) -> bool:
     return handle_views >= 2
 
 
-def candidate_score(mesh, expected_aspect: float, handle_expected: bool) -> tuple[float, dict]:
+def normalized_observed_mask(image: Image.Image, size: int = 128) -> np.ndarray:
+    alpha = np.asarray(image.getchannel("A")) > 127
+    ys, xs = np.where(alpha)
+    canvas = Image.new("L", (size, size), 0)
+    if not len(xs):
+        return np.asarray(canvas) > 127
+    crop = Image.fromarray((alpha[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1] * 255).astype(np.uint8))
+    crop.thumbnail((size - 12, size - 12), Image.Resampling.NEAREST)
+    canvas.paste(crop, ((size - crop.width) // 2, (size - crop.height) // 2))
+    return np.asarray(canvas) > 127
+
+
+def _validation_mesh(mesh: trimesh.Trimesh, target_faces: int = 24000) -> trimesh.Trimesh:
+    if len(mesh.faces) <= target_faces:
+        return mesh
+    try:
+        simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
+        if len(simplified.faces) >= target_faces * 0.55:
+            return simplified
+    except Exception:
+        pass
+    return mesh
+
+
+def rasterized_mesh_silhouettes(mesh: trimesh.Trimesh, size: int = 128) -> dict[str, np.ndarray]:
+    """Render canonical silhouettes without an OpenGL dependency."""
+    probe = _validation_mesh(mesh)
+    vertices = np.asarray(probe.vertices, dtype=np.float64)
+    faces = np.asarray(probe.faces, dtype=np.int64)
+    if not len(vertices) or not len(faces):
+        empty = np.zeros((size, size), dtype=bool)
+        return {name: empty for name in ("front", "left", "back", "right", "top", "bottom")}
+    projections = {
+        "front": vertices[:, [0, 1]] * np.array([1.0, 1.0]),
+        "left": vertices[:, [2, 1]] * np.array([1.0, 1.0]),
+        "back": vertices[:, [0, 1]] * np.array([-1.0, 1.0]),
+        "right": vertices[:, [2, 1]] * np.array([-1.0, 1.0]),
+        # Top/base photographs must validate the generated shape without being
+        # misused as one of the four lateral diffusion conditions.
+        "top": vertices[:, [0, 2]] * np.array([1.0, 1.0]),
+        "bottom": vertices[:, [0, 2]] * np.array([-1.0, 1.0]),
+    }
+    rendered: dict[str, np.ndarray] = {}
+    for name, points in projections.items():
+        low = points.min(axis=0)
+        span = np.maximum(points.max(axis=0) - low, 1e-8)
+        scale = (size - 12) / float(max(span))
+        screen = (points - low) * scale
+        screen += (np.array([size, size]) - span * scale) / 2
+        screen[:, 1] = size - 1 - screen[:, 1]
+        canvas = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(canvas)
+        for triangle in screen[faces]:
+            draw.polygon([(float(x), float(y)) for x, y in triangle], fill=255)
+        rendered[name] = np.asarray(canvas) > 127
+    return rendered
+
+
+def silhouette_similarity(observed: np.ndarray, rendered: np.ndarray) -> float:
+    union = np.logical_or(observed, rendered).sum()
+    if not union:
+        return 0.0
+    iou = float(np.logical_and(observed, rendered).sum() / union)
+    observed_rows = observed.mean(axis=1)
+    rendered_rows = rendered.mean(axis=1)
+    observed_cols = observed.mean(axis=0)
+    rendered_cols = rendered.mean(axis=0)
+    profile_error = (
+        float(np.mean(np.abs(observed_rows - rendered_rows)))
+        + float(np.mean(np.abs(observed_cols - rendered_cols)))
+    ) / 2
+    return float(np.clip(iou * 0.76 + (1.0 - profile_error) * 0.24, 0.0, 1.0))
+
+
+def multiview_silhouette_evidence(
+    mesh: trimesh.Trimesh,
+    group_images: list[Image.Image],
+    all_images: list[Image.Image],
+) -> dict[str, float]:
+    rendered = rasterized_mesh_silhouettes(mesh)
+    slots = ["front", "left", "back", "right"]
+    ordered_scores = [
+        silhouette_similarity(normalized_observed_mask(image), rendered[slot])
+        for image, slot in zip(group_images, slots)
+    ]
+    variants = [*rendered.values(), *[np.fliplr(mask) for mask in rendered.values()]]
+    coverage_scores = []
+    for image in all_images:
+        observed = normalized_observed_mask(image)
+        coverage_scores.append(max(silhouette_similarity(observed, candidate) for candidate in variants))
+    ordered = float(np.mean(ordered_scores)) if ordered_scores else 0.0
+    coverage = float(np.mean(coverage_scores)) if coverage_scores else ordered
+    return {
+        "ordered_silhouette": ordered,
+        "all_view_silhouette": coverage,
+        "silhouette_evidence": ordered * 0.62 + coverage * 0.38,
+    }
+
+
+def candidate_score(
+    mesh,
+    expected_aspect: float,
+    handle_expected: bool,
+    evidence: dict[str, float] | None = None,
+) -> tuple[float, dict]:
+    face_count = int(len(mesh.faces))
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    if face_count == 0 or vertices.ndim != 2 or len(vertices) < 4:
+        details = {
+            "score": 0.0,
+            "expected_aspect": round(expected_aspect, 4),
+            "generated_aspect": 0.0,
+            "faces": face_count,
+            "euler_number": 2,
+            "watertight": False,
+            "handle_expected": handle_expected,
+            "handle_topology": False,
+            "main_face_ratio": 0.0,
+            "significant_components": 999,
+            "secondary_planar_component": False,
+            "dominant_sheet_ratio": 0.0,
+            "ordered_silhouette": 0.0,
+            "all_view_silhouette": 0.0,
+            "silhouette_evidence": 0.0,
+        }
+        return -100.0, details
     extents = np.maximum(np.asarray(mesh.extents, dtype=float), 1e-6)
     # Hunyuan shape space uses Y as its upright axis.
     generated_aspect = float(max(extents[0], extents[2]) / extents[1])
     aspect_error = abs(float(np.log(generated_aspect / max(expected_aspect, 1e-6))))
     finite = bool(np.isfinite(mesh.vertices).all())
-    face_count = int(len(mesh.faces))
-    try:
-        # Probe topology on a light copy.  Raw marching-cubes output contains
-        # split vertices, while the 30k-face probe is welded by simplification
-        # and makes a connected-component check inexpensive.
-        probe = mesh.simplify_quadric_decimation(face_count=30000) if face_count > 45000 else mesh.copy()
-        probe_components = probe.split(only_watertight=False)
-        probe_main = max(probe_components, key=lambda component: len(component.faces))
-        euler_number = int(probe_main.euler_number)
-        watertight = bool(probe_main.is_watertight)
-    except Exception:
-        euler_number = 2
-        watertight = False
+    report = topology_report(mesh)
+    euler_number = report.euler_number
+    watertight = report.watertight
+    main_face_ratio = report.main_face_ratio
+    significant_components = report.significant_components
+    secondary_planar = report.secondary_planar_component
+    dominant_sheet_ratio = report.dominant_sheet_ratio
     score = 100.0 - min(75.0, aspect_error * 62.0)
     if not finite or face_count < 1000:
         score -= 80
     if generated_aspect < 0.45 or generated_aspect > 3.2:
         score -= 20
+    score += (main_face_ratio - 0.70) * 45
+    score -= max(0, significant_components - 6) * 1.6
+    if secondary_planar:
+        score -= 35
+    if dominant_sheet_ratio >= 0.20:
+        score -= min(75.0, 40.0 + (dominant_sheet_ratio - 0.20) * 180.0)
     # A handle is topological, not merely a wide silhouette.  Prefer a genus-1
     # candidate when multiple photographs clearly show its enclosed opening.
     # This stops a broad handle-less body from winning on aspect ratio alone.
     handle_topology = watertight and euler_number <= 0
     if handle_expected:
         score += 9 if handle_topology else -28
+    # Prefer the simplest topology that explains the observed openings.  A
+    # handled watertight object normally needs genus 1 (Euler 0); an extra
+    # tunnel is usually a diffusion artefact even when its silhouette is close.
+    # The penalty is deliberately modest so clearly observed complex objects
+    # can still win through stronger multiview evidence.
+    if watertight:
+        expected_euler = 0 if handle_expected else 2
+        score -= min(15.0, abs(euler_number - expected_euler) * 2.5)
+    if evidence:
+        silhouette_evidence = float(evidence.get("silhouette_evidence", 0.0))
+        score += (silhouette_evidence - 0.58) * 105
+        if float(evidence.get("all_view_silhouette", 0.0)) < 0.48:
+            score -= 24
+    else:
+        evidence = {
+            "ordered_silhouette": 0.0,
+            "all_view_silhouette": 0.0,
+            "silhouette_evidence": 0.0,
+        }
     details = {
         "score": round(max(0.0, score), 2),
         "expected_aspect": round(expected_aspect, 4),
@@ -149,6 +336,13 @@ def candidate_score(mesh, expected_aspect: float, handle_expected: bool) -> tupl
         "watertight": watertight,
         "handle_expected": handle_expected,
         "handle_topology": handle_topology,
+        "main_face_ratio": round(main_face_ratio, 4),
+        "significant_components": significant_components,
+        "secondary_planar_component": secondary_planar,
+        "dominant_sheet_ratio": round(dominant_sheet_ratio, 4),
+        "ordered_silhouette": round(float(evidence.get("ordered_silhouette", 0.0)), 4),
+        "all_view_silhouette": round(float(evidence.get("all_view_silhouette", 0.0)), 4),
+        "silhouette_evidence": round(float(evidence.get("silhouette_evidence", 0.0)), 4),
     }
     return score, details
 
@@ -193,31 +387,71 @@ def optimize_mesh(mesh, target_faces: int):
     return mesh, original_faces
 
 
-def apply_pbr_material(mesh, base_colour: np.ndarray):
-    material = trimesh.visual.material.PBRMaterial(
-        name="AI PBR material",
-        baseColorFactor=base_colour,
-        metallicFactor=0.0,
-        roughnessFactor=0.34,
+def refine_surface(
+    mesh: trimesh.Trimesh,
+    expected_aspect: float,
+    handle_expected: bool,
+    group_images: list[Image.Image],
+    all_images: list[Image.Image],
+    category: str,
+) -> tuple[trimesh.Trimesh, bool, dict]:
+    """Remove diffusion noise only when geometric evidence is preserved.
+
+    A tiny Taubin pass makes manufactured and organic surfaces less lumpy.  It
+    is accepted only if topology remains safe and silhouette support does not
+    regress, so detailed or thin objects keep their unsmoothed geometry.
+    """
+    iterations = {
+        "product": 4,
+        "character": 4,
+        "generic": 2,
+        "other": 2,
+        "vehicle": 2,
+        "furniture": 2,
+        "architecture": 0,
+    }.get(category, 2)
+    baseline_evidence = multiview_silhouette_evidence(mesh, group_images, all_images)
+    baseline_score, baseline_details = candidate_score(
+        mesh, expected_aspect, handle_expected, baseline_evidence
     )
-    # A constant UV is intentional: this is a coherent base material, not a
-    # falsely calibrated photo projection.  A future texture model can replace it.
-    mesh.visual = trimesh.visual.TextureVisuals(
-        uv=np.zeros((len(mesh.vertices), 2), dtype=np.float32),
-        material=material,
-    )
-    return mesh
+    if iterations <= 0:
+        return mesh, False, baseline_details
+    try:
+        refined = mesh.copy()
+        trimesh.smoothing.filter_taubin(
+            refined,
+            lamb=0.32,
+            nu=0.34,
+            iterations=iterations,
+        )
+        refined_evidence = multiview_silhouette_evidence(refined, group_images, all_images)
+        refined_score, refined_details = candidate_score(
+            refined, expected_aspect, handle_expected, refined_evidence
+        )
+        evidence_ok = (
+            float(refined_evidence.get("all_view_silhouette", 0.0))
+            >= float(baseline_evidence.get("all_view_silhouette", 0.0)) - 0.006
+        )
+        if evidence_ok and refined_score >= baseline_score - 1.25 and is_usable_topology(
+            refined_details, refined_score
+        ):
+            return refined, True, refined_details
+    except Exception as error:
+        print(f"HUNYUAN_SMOOTHING_WARNING {error}", flush=True)
+    return mesh, False, baseline_details
 
 
 def main():
     if not torch.cuda.is_available():
         raise RuntimeError("Hunyuan3D requer CUDA; PyTorch não detetou a GPU NVIDIA.")
+    image_paths, mask_paths, view_groups, view_group_names = load_inputs()
     images = normalize_orientations(
-        [foreground_image(image, mask) for image, mask in zip(args.images, args.masks)]
+        [foreground_image(image, mask) for image, mask in zip(image_paths, mask_paths)]
     )
     view_names = ["front", "left", "back", "right"]
-    conditions = {name: image for name, image in zip(view_names, images[:4])}
-    expected_aspect = expected_silhouette_aspect(images)
+    conditioning_indices = sorted({index for group in view_groups for index in group})
+    conditioning_images = [images[index] for index in conditioning_indices]
+    expected_aspect = expected_silhouette_aspect(conditioning_images)
     handle_expected = expects_handle_topology(images)
     base_colour = estimate_base_colour(images)
 
@@ -232,23 +466,92 @@ def main():
     best_mesh = None
     best_score = float("-inf")
     best_details = {}
-    candidate_count = max(1, min(args.candidates, 4))
+    candidate_count = max(1, min(args.candidates, 8))
+    maximum_attempts = min(8, candidate_count + 2)
     generated_count = 0
-    for index in range(candidate_count):
+    attempted_count = 0
+    candidate_errors = []
+    for index in range(maximum_attempts):
+        # Extra seeds are recovery attempts and only run when the normal budget
+        # failed to produce a safe topology.
+        if index >= candidate_count and best_mesh is not None and is_usable_topology(best_details, best_score):
+            break
+        group_index = index % len(view_groups)
+        group = view_groups[group_index]
+        group_images = [images[image_index] for image_index in group]
+        conditions = {name: image for name, image in zip(view_names, group_images)}
+        group_aspect = expected_silhouette_aspect(group_images)
         seed = args.seed + index * 7919
-        mesh = pipeline(
-            image=conditions,
-            num_inference_steps=5,
-            octree_resolution=args.resolution,
-            num_chunks=8000,
-            generator=torch.manual_seed(seed),
-            output_type="trimesh",
-        )[0]
-        score, details = candidate_score(mesh, expected_aspect, handle_expected)
-        details.update({"index": index + 1, "seed": seed})
+        attempted_count += 1
+        resolution = args.resolution if index < candidate_count else max(128, args.resolution // 2)
+        try:
+            raw_mesh = pipeline(
+                image=conditions,
+                num_inference_steps=5,
+                octree_resolution=resolution,
+                num_chunks=8000,
+                generator=torch.manual_seed(seed),
+                output_type="trimesh",
+            )[0]
+        except Exception as error:
+            candidate_errors.append(str(error)[:280])
+            print(
+                f"HUNYUAN_CANDIDATE_ERROR {json.dumps({'index': index + 1, 'seed': seed, 'error': str(error)[:280]}, separators=(',', ':'))}",
+                flush=True,
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
+
+        cleaned_mesh = sanitize_mesh(raw_mesh)
+        raw_evidence = multiview_silhouette_evidence(cleaned_mesh, group_images, images)
+        raw_score, raw_details = candidate_score(cleaned_mesh, group_aspect, handle_expected, raw_evidence)
+        repaired_mesh, repair = repair_candidate(cleaned_mesh)
+        if repair["changed"]:
+            repaired_evidence = multiview_silhouette_evidence(repaired_mesh, group_images, images)
+        else:
+            repaired_evidence = raw_evidence
+        repaired_score, repaired_details = candidate_score(
+            repaired_mesh,
+            group_aspect,
+            handle_expected,
+            repaired_evidence,
+        )
+        use_repaired = bool(
+            repair["changed"]
+            and (
+                repaired_score > raw_score + 2
+                or (
+                    not is_usable_topology(raw_details, raw_score)
+                    and is_usable_topology(repaired_details, repaired_score)
+                )
+            )
+        )
+        if use_repaired:
+            mesh, score, details = repaired_mesh, repaired_score, repaired_details
+            candidate_recovery = "mesh_repair"
+            del cleaned_mesh
+        else:
+            mesh, score, details = cleaned_mesh, raw_score, raw_details
+            candidate_recovery = "retry_seed" if index >= candidate_count else "none"
+            del repaired_mesh
+        del raw_mesh
+        details.update(
+            {
+                "index": index + 1,
+                "seed": seed,
+                "resolution": resolution,
+                "view_group": group_index + 1,
+                "conditioning_views": view_group_names[group_index] if group_index < len(view_group_names) else group,
+                "recovery_mode": candidate_recovery,
+                "repair": repair,
+            }
+        )
         generated_count += 1
         print(f"HUNYUAN_CANDIDATE {json.dumps(details, separators=(',', ':'))}", flush=True)
         if score > best_score:
+            if best_mesh is not None:
+                del best_mesh
             best_mesh = mesh
             best_score = score
             best_details = details
@@ -256,15 +559,49 @@ def main():
             del mesh
         gc.collect()
         torch.cuda.empty_cache()
-        # A high-scoring genus-1 mesh already satisfies both the silhouette and
-        # the observed handle constraint.  Further diffusion runs add latency
-        # without a meaningful chance of improving this local result.
-        if handle_expected and details["handle_topology"] and score >= 95:
-            break
+        # Do not stop before every angular set has produced evidence.  Different
+        # subsets can expose missing backs, bases and thin attachments even when
+        # an early candidate looks topologically valid.
 
-    if best_mesh is None:
-        raise RuntimeError("Nenhum candidato 3D utilizável foi produzido.")
+    result_tier = "ai_assisted"
+    recovery_mode = str(best_details.get("recovery_mode", "none"))
+    recovery_warnings = []
+    if best_mesh is None or not is_usable_topology(best_details, best_score):
+        best_mesh, recovery_mode = build_estimated_proxy(best_mesh, expected_aspect)
+        best_score, proxy_details = candidate_score(best_mesh, expected_aspect, handle_expected)
+        proxy_details.update(
+            {
+                "index": best_details.get("index", 0),
+                "seed": best_details.get("seed"),
+                "recovery_mode": recovery_mode,
+            }
+        )
+        best_details = proxy_details
+        result_tier = "estimated"
+        recovery_warnings.append(
+            "As vistas não suportaram uma malha detalhada estável; foi criada uma aproximação volumétrica segura."
+        )
+    elif recovery_mode == "mesh_repair":
+        recovery_warnings.append(
+            "A geometria gerada foi soldada e foram removidas pequenas superfícies isoladas."
+        )
+    elif int(best_details.get("index", 0)) > candidate_count:
+        recovery_mode = "retry_seed"
+        recovery_warnings.append("O modelo foi recuperado automaticamente com uma semente adicional.")
+
     best_mesh, original_faces = optimize_mesh(best_mesh, max(10000, args.target_faces))
+    best_group_index = max(0, int(best_details.get("view_group", 1)) - 1) % len(view_groups)
+    best_texture_images = [images[index] for index in view_groups[best_group_index]]
+    best_mesh, surface_smoothed, refined_details = refine_surface(
+        best_mesh,
+        expected_aspect,
+        handle_expected,
+        best_texture_images,
+        images,
+        args.category,
+    )
+    # Keep candidate identity/recovery metadata while reporting final geometry.
+    best_details = {**best_details, **refined_details}
     optimized_components = best_mesh.split(only_watertight=False)
     optimized_main = max(optimized_components, key=lambda component: len(component.faces))
     handle_preserved = bool(optimized_main.is_watertight and optimized_main.euler_number <= 0)
@@ -286,14 +623,32 @@ def main():
             # offload keeps it viable on common 8 GB laptop GPUs at the cost of
             # additional time, while the surrounding worker remains responsive.
             paint.enable_model_cpu_offload()
-            best_mesh = paint(best_mesh, image=images[:4])
+            best_mesh = paint(best_mesh, image=best_texture_images)
             material_mode = "hunyuan_paint_multiview"
             del paint
             gc.collect()
             torch.cuda.empty_cache()
         except Exception as error:
             print(f"HUNYUAN_TEXTURE_WARNING {error}", flush=True)
-            best_mesh = apply_pbr_material(best_mesh, base_colour)
+            try:
+                best_mesh = apply_multiview_uv_texture(
+                    best_mesh, best_texture_images, base_colour, texture_size=1024
+                )
+                material_mode = "multiview_uv_texture"
+            except Exception as bake_error:
+                print(f"HUNYUAN_UV_TEXTURE_WARNING {bake_error}", flush=True)
+                best_mesh = apply_multiview_vertex_colours(best_mesh, best_texture_images, base_colour)
+                material_mode = "multiview_vertex_color"
+    elif args.project_colors:
+        try:
+            best_mesh = apply_multiview_uv_texture(
+                best_mesh, best_texture_images, base_colour, texture_size=1024
+            )
+            material_mode = "multiview_uv_texture"
+        except Exception as error:
+            print(f"HUNYUAN_UV_TEXTURE_WARNING {error}", flush=True)
+            best_mesh = apply_multiview_vertex_colours(best_mesh, best_texture_images, base_colour)
+            material_mode = "multiview_vertex_color"
     else:
         best_mesh = apply_pbr_material(best_mesh, base_colour)
     output = Path(args.output)
@@ -304,10 +659,27 @@ def main():
         "faces": int(len(best_mesh.faces)),
         "faces_before_optimization": original_faces,
         "candidate_count": generated_count,
+        "attempted_candidates": attempted_count,
         "selected_candidate": best_details.get("index", 1),
-        "candidate_score": round(max(0.0, best_score), 2),
+        "candidate_score": round(min(100.0, max(0.0, best_score)), 2),
+        "result_tier": result_tier,
+        "recovery_mode": recovery_mode,
+        "recovery_warnings": recovery_warnings,
+        "candidate_errors": candidate_errors,
+        "estimated_geometry": result_tier == "estimated",
+        "inferred_geometry": True,
         "handle_expected": handle_expected,
         "handle_preserved": handle_preserved,
+        "surface_smoothed": surface_smoothed,
+        "main_face_ratio": best_details.get("main_face_ratio", 0),
+        "significant_components": best_details.get("significant_components", 0),
+        "secondary_planar_component": best_details.get("secondary_planar_component", False),
+        "dominant_sheet_ratio": best_details.get("dominant_sheet_ratio", 0),
+        "silhouette_evidence": best_details.get("silhouette_evidence", 0),
+        "ordered_silhouette": best_details.get("ordered_silhouette", 0),
+        "all_view_silhouette": best_details.get("all_view_silhouette", 0),
+        "view_groups": len(view_groups),
+        "validation_views": len(images),
         "base_color": [int(value) for value in base_colour],
         "material": material_mode,
         "output": str(output),

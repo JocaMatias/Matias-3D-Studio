@@ -2,18 +2,18 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Camera, Layers3, Sparkles } from "lucide-react";
+import { ArrowRight, Layers3, ScanLine, Sparkles } from "lucide-react";
 import { Project, ProjectType, request } from "@/lib/api";
 
-const choices: { value: ProjectType; title: string; description: string; icon: typeof Camera }[] = [
-  { value: "real_photos", title: "Fotografias reais", description: "Vistas do mesmo objeto físico, captadas à sua volta.", icon: Camera },
-  { value: "ai_references", title: "Referências de IA", description: "Imagens consistentes do mesmo conceito; escolhe uma vista principal.", icon: Sparkles },
-  { value: "hybrid", title: "Modo híbrido", description: "Combina fotografias reais com referências que completam zonas ocultas.", icon: Layers3 },
+const choices: { value: ProjectType; title: string; description: string; icon: typeof Sparkles }[] = [
+  { value: "ai_multiview", title: "IA Multivista", description: "1–4 imagens. Gera as zonas ocultas e compara vários candidatos.", icon: Sparkles },
+  { value: "hybrid", title: "Reconstrução híbrida", description: "5–15 imagens. Combina observação real com preenchimento assistido por IA.", icon: Layers3 },
+  { value: "precision_scan", title: "Digitalização precisa", description: "20+ imagens. Recupera câmaras, geometria densa e textura projetada.", icon: ScanLine },
 ];
 
 export default function NewProject() {
   const router = useRouter();
-  const [projectType, setProjectType] = useState<ProjectType>("real_photos");
+  const [projectType, setProjectType] = useState<ProjectType>("ai_multiview");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -38,7 +38,7 @@ export default function NewProject() {
     <main className="shell">
       <form className="card form" onSubmit={submit}>
         <h1>O que vamos modelar?</h1>
-        <p className="sub">Define a origem das imagens para o motor escolher a estratégia mais adequada.</p>
+        <p className="sub">Escolhe o nível de cobertura disponível; cada modo tem validação e motor próprios.</p>
         {error && <p className="error">{error}</p>}
 
         <div className="field">
@@ -50,7 +50,7 @@ export default function NewProject() {
           <textarea className="input" name="description" rows={3} placeholder="Material, escala, detalhes importantes ou objetivo do modelo" />
         </div>
         <div className="field">
-          <label>Origem das imagens</label>
+          <label>Modo de geração</label>
           <div className="choice-grid">
             {choices.map((choice) => {
               const Icon = choice.icon;

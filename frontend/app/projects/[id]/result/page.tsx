@@ -47,6 +47,13 @@ export default function Result() {
   const displayable = Boolean(glb && !simulated && glb.artifact_metadata.displayable !== false);
   const fidelity = Number(metrics.visual_fidelity ?? project?.quality_score ?? 0);
   const confidence = Number(metrics.geometric_confidence ?? 0);
+  const observedCoverage = Number(metrics.observed_coverage ?? 0);
+  const resultTier = String(metrics.result_tier ?? glb?.artifact_metadata.result_tier ?? "");
+  const recoveryMode = String(metrics.recovery_mode ?? glb?.artifact_metadata.recovery_mode ?? "none");
+  const recoveryWarnings = Array.isArray(metrics.recovery_warnings)
+    ? metrics.recovery_warnings.map(String).filter(Boolean)
+    : [];
+  const generativeAi = metrics.generative_ai === true || glb?.artifact_metadata.generative_ai === true;
   const beforeOptimization = Number(metrics.triangles_before_optimization ?? 0);
   const finalTriangles = Number(metrics.triangles ?? 0);
   const reduction = beforeOptimization > finalTriangles && beforeOptimization ? Math.round((1 - finalTriangles / beforeOptimization) * 100) : 0;
@@ -85,6 +92,30 @@ export default function Result() {
           </div>
           {version.id !== selectedId && <button className="btn" onClick={() => { setCompareId(selectedId || ""); setSelectedId(version.id); }}><ArrowLeftRight size={16} /> Mostrar no viewer</button>}
         </article>)}
+      </section>}
+
+      {!failed && !simulated && generativeAi && <section
+        className="card row"
+        style={{
+          marginBottom: 16,
+          alignItems: "flex-start",
+          borderColor: resultTier === "estimated" ? "var(--warning)" : undefined,
+          background: resultTier === "estimated" ? "rgba(255, 184, 108, 0.07)" : undefined,
+        }}
+        aria-label="Origem e confiança da geometria"
+      >
+        <AlertTriangle size={24} color={resultTier === "estimated" ? "var(--warning)" : "var(--accent)"} />
+        <div>
+          <div className="eyebrow" style={resultTier === "estimated" ? { color: "var(--warning)" } : undefined}>
+            {resultTier === "estimated" ? "Modelo volumétrico estimado" : recoveryMode !== "none" ? "Reconstrução recuperada automaticamente" : "Geometria assistida por IA"}
+          </div>
+          <p className="sub" style={{ marginBottom: 0 }}>
+            {resultTier === "estimated"
+              ? "As imagens não sustentaram detalhe 3D estável. O sistema entregou uma aproximação sólida e segura, com confiança limitada, em vez de falhar ou mostrar fragmentos."
+              : `${observedCoverage ? `${observedCoverage}% da forma` : "Parte da forma"} tem apoio estimado nas vistas; a IA completou as zonas ocultas. Verifica medidas e detalhes críticos antes de produção.`}
+          </p>
+          {recoveryWarnings.map((warning) => <p className="sub" style={{ margin: "6px 0 0" }} key={warning}>{warning}</p>)}
+        </div>
       </section>}
 
       {failed ? <section className="card mock-blocker"><AlertTriangle size={42} color="var(--warning)" /><div><div className="eyebrow" style={{ color: "var(--warning)" }}>Reconstrução incompleta</div><h2>Esta versão não gerou geometria fiável.</h2><p className="sub">{selectedVersion?.warnings?.[0] || job?.error_message}</p><p className="sub">As versões anteriores permanecem intactas. Adiciona vistas das zonas frágeis e cria uma nova versão.</p><Link className="btn primary" href={`/projects/${id}/capture`}><RotateCcw size={17} /> Melhorar referências</Link></div></section>

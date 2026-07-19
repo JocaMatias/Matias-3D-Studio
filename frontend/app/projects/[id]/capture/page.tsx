@@ -11,6 +11,8 @@ type Report = {
   warnings: number;
   rejected: number;
   messages: string[];
+  minimum_images?: number;
+  recommended_images?: string;
   real_reconstruction_ready?: boolean;
   pipeline?: {
     key: string;
@@ -18,6 +20,8 @@ type Report = {
     description: string;
     uses_generative_ai: boolean;
     uses_photogrammetry: boolean;
+    minimum_images?: number;
+    recommended_images?: string;
   };
   visual_fidelity_estimate?: number;
   geometric_confidence_estimate?: number;
@@ -50,7 +54,9 @@ function normalizeReport(
     warnings,
     rejected,
     messages: Array.isArray(value?.messages) ? value.messages : [],
-    real_reconstruction_ready: value?.real_reconstruction_ready ?? approved + warnings >= 5,
+    minimum_images: value?.minimum_images,
+    recommended_images: value?.recommended_images,
+    real_reconstruction_ready: value?.real_reconstruction_ready ?? approved + warnings >= (value?.minimum_images ?? 1),
     pipeline: value?.pipeline,
     visual_fidelity_estimate: value?.visual_fidelity_estimate,
     geometric_confidence_estimate: value?.geometric_confidence_estimate,
@@ -153,9 +159,28 @@ export default function Capture() {
     void upload(event.dataTransfer.files);
   }
 
+  const modeMinimum = project?.project_type === "precision_scan" ? 20 : project?.project_type === "hybrid" ? 5 : 1;
+  const modeCopy = project?.project_type === "precision_scan"
+    ? {
+        title: "Digitalização precisa com 20+ fotos",
+        subtitle: "20+ imagens · sobreposição elevada · textura visual repetível",
+        items: ["Duas voltas completas com 70–80% de sobreposição", "Uma volta lateral e outra superior", "Luz suave e exposição constante"],
+      }
+    : project?.project_type === "hybrid"
+      ? {
+          title: "Reconstrução híbrida com 5–15 fotos",
+          subtitle: "5–15 imagens · mais vistas observadas, menos zonas inferidas",
+          items: ["Frente, traseira, esquerda e direita", "Uma vista ligeiramente superior", "Mantém o objeto e a distância constantes"],
+        }
+      : {
+          title: "IA Multivista com 1–4 imagens",
+          subtitle: "1–4 imagens · as zonas ocultas são inferidas pela IA",
+          items: ["Marca como principal a vista que melhor define o objeto", "Prefere ângulos complementares, não repetidos", "Mantém forma, materiais e detalhes idênticos"],
+        };
+
   const canReconstruct = Boolean(
     report &&
-    (report.real_reconstruction_ready ?? report.approved + report.warnings >= 5) &&
+    (report.real_reconstruction_ready ?? report.approved + report.warnings >= modeMinimum) &&
     engine?.available &&
     engine.real_reconstruction,
   );
@@ -166,7 +191,7 @@ export default function Capture() {
         <div>
           <div className="eyebrow">Captura · {project?.name}</div>
           <h1>Adiciona as fotografias</h1>
-          <p className="sub">JPG ou PNG · 5–10 imagens para começar · mais vistas úteis aumentam a precisão</p>
+          <p className="sub">JPG ou PNG · {modeCopy.subtitle}</p>
         </div>
         <span className="badge">{images.length} imagens carregadas</span>
       </div>
@@ -206,14 +231,11 @@ export default function Capture() {
         <aside>
           <div className="card">
             <Camera color="var(--mint)" />
-            <h3>{project?.project_type === "ai_references" ? "Referências IA consistentes" : project?.project_type === "hybrid" ? "Captura híbrida coerente" : "Para um bom modelo com 5–10 fotos"}</h3>
+            <h3>{modeCopy.title}</h3>
             <ul className="checklist">
-              <li>{project?.project_type === "ai_references" ? "Marca com a estrela a vista que define o objeto" : "Frente, traseira, esquerda e direita"}</li>
-              <li>Uma vista ligeiramente superior</li>
-              <li>{project?.project_type === "ai_references" ? "Mantém proporções, materiais e detalhes idênticos" : "Luz suave; desliga o flash"}</li>
+              {modeCopy.items.map((item) => <li key={item}>{item}</li>)}
               <li>Distância e zoom constantes</li>
               <li>Objeto completo e centrado em todas</li>
-              <li>Fotos adicionais refinam zonas ocultas</li>
             </ul>
           </div>
 
@@ -287,7 +309,7 @@ export default function Capture() {
             </select>
           </label>
           <button className="btn primary" style={{ width: "100%", marginTop: 10 }} disabled={!canReconstruct || busy} onClick={() => void reconstruct()}>
-            {report?.pipeline?.key === "hybrid" ? "Reconstruir em modo híbrido" : "Gerar modelo com IA"}
+            {project?.project_type === "precision_scan" ? "Iniciar digitalização precisa" : project?.project_type === "hybrid" ? "Iniciar reconstrução híbrida" : "Gerar com IA Multivista"}
           </button>
         </aside>
       </div>

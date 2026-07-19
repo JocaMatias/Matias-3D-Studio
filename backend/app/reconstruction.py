@@ -30,6 +30,9 @@ STAGES = [
     "Exportar GLB",
 ]
 
+PIPELINE_VERSION = "quality-first-v8"
+MASK_PIPELINE_VERSION = "isnet-quality-v2"
+
 _LOCAL_JOB_QUEUE: queue.Queue[str] = queue.Queue()
 _LOCAL_WORKER_LOCK = threading.Lock()
 _LOCAL_WORKER: threading.Thread | None = None
@@ -193,16 +196,18 @@ def reconstruction_engine_status() -> dict:
     photogrammetry_available = executable is not None and all(required_openmvs)
     hunyuan_python, hunyuan_generator = _find_hunyuan_runtime()
     generative_available = hunyuan_python is not None and hunyuan_generator is not None
+    paint_model_available = _find_hunyuan_texture_model() is not None
+    paint_runtime_available = bool(hunyuan_python and _hunyuan_texture_runtime(hunyuan_python))
     available = photogrammetry_available or generative_available
     if photogrammetry_available and generative_available:
-        message = "IA multivista e fotogrametria prontas; o modo é escolhido automaticamente."
+        message = "IA multivista e fotogrametria prontas para os três modos de geração."
     elif generative_available:
-        message = "IA multivista pronta para reconstrução com 5–10 fotografias."
+        message = "IA Multivista pronta; a Reconstrução híbrida usa validação reforçada."
     else:
         message = "Os motores de reconstrução não foram encontrados."
     return {
         "mode": mode,
-        "pipeline_version": "adaptive-ai-v2",
+        "pipeline_version": PIPELINE_VERSION,
         "available": available,
         "real_reconstruction": True,
         "executable": str(executable) if executable else None,
@@ -210,7 +215,10 @@ def reconstruction_engine_status() -> dict:
         "generative_ai": generative_available,
         "photogrammetry": photogrammetry_available,
         "minimum_images": MINIMUM_AI_IMAGES,
-        "recommended_images": "5–10",
+        "recommended_images": "1–4 / 5–15 / 20+",
+        "texture_model": paint_model_available,
+        "native_texture_runtime": paint_runtime_available,
+        "texture_fallback": "multiview_uv_texture",
         "message": message,
     }
 
@@ -276,7 +284,17 @@ def _ensure_local_worker() -> None:
 
 def queue_job(job_id: str) -> str:
     """Queue a reconstruction locally or in Redis without losing the job identity."""
-    if settings.queue_mode.lower() == "rq":
+    queue_mode = settings.queue_mode.lower()
+    if queue_mode == "inline":
+        queue_id = f"inline:{job_id}"
+        with SessionLocal() as db:
+            job = db.get(ReconstructionJob, job_id)
+            if job:
+                job.queue_id = queue_id
+                db.commit()
+        run_job(job_id)
+        return queue_id
+    if queue_mode == "rq":
         from redis import Redis
         from rq import Queue
 
@@ -334,15 +352,19 @@ def run_job(job_id: str) -> None:
             strategy = strategy_for_project(project.project_type, usable, trackability["level"])
             job.configuration = {
                 **(job.configuration or {}),
-                "pipeline_version": "adaptive-ai-v2",
+                "pipeline_version": PIPELINE_VERSION,
                 "photogrammetry_trackability": trackability,
                 "strategy": strategy.as_dict(),
             }
             db.commit()
             hunyuan_python, _ = _find_hunyuan_runtime()
-            if strategy.key == "hybrid" and _find_colmap_executable():
+            if strategy.uses_photogrammetry and _find_colmap_executable():
                 try:
                     _run_colmap(db, job, project)
+                except JobCancelled:
+                    # Cancellation is a terminal user action, not a reason to
+                    # silently start a second, GPU-heavy fallback process.
+                    raise
                 except Exception as photogrammetry_error:
                     if not hunyuan_python:
                         raise
@@ -352,7 +374,7 @@ def run_job(job_id: str) -> None:
                         "photogrammetry_fallback_reason": str(photogrammetry_error),
                     }
                     db.commit()
-                    _run_hunyuan(db, job, project, strategy_key="hybrid_fallback")
+                    _run_hunyuan(db, job, project, strategy_key=f"{strategy.key}_fallback")
             else:
                 _run_hunyuan(db, job, project, strategy_key=strategy.key)
         else:
@@ -399,14 +421,22 @@ def _advance(db, job, stage, percent: int, message: str):
     db.refresh(job)
     if job.status == "cancelled":
         raise JobCancelled("Reconstrução cancelada pelo utilizador.")
+    restarting_completed_stage = percent < 100 and (
+        stage.status == "completed" or stage.completed_at is not None
+    )
     stage.status = "processing" if percent < 100 else "completed"
-    stage.started_at = stage.started_at or _now()
+    if restarting_completed_stage:
+        stage.started_at = _now()
+    else:
+        stage.started_at = stage.started_at or _now()
     stage.progress = percent
     stage.message = message
     job.current_stage = stage.name
     job.progress = min(99, round(((stage.order - 1) + percent / 100) / len(STAGES) * 100))
     if percent == 100:
         stage.completed_at = _now()
+    else:
+        stage.completed_at = None
     db.commit()
 
 
@@ -450,6 +480,7 @@ def _finish(db, job, project, output: Path, metrics: dict, metadata: dict):
         version.metrics = metrics
         version.configuration = job.configuration or {}
         version.logs_path = job.logs_path
+        version.warnings = [str(value) for value in metadata.get("recovery_warnings", []) if str(value).strip()]
         version.completed_at = job.completed_at
         if job.started_at:
             started = job.started_at.replace(tzinfo=timezone.utc) if job.started_at.tzinfo is None else job.started_at
@@ -637,11 +668,33 @@ def _render_model_preview(source: Path, output: Path) -> None:
         raise RuntimeError("A mesh tem dimensões inválidas.")
     vertices /= extent
 
-    yaw = np.deg2rad(32.0)
-    pitch = np.deg2rad(-18.0)
-    rotate_y = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
+    # Positive pitch shows the top surface/opening.  The previous negative
+    # angle viewed models from below, making valid cups look sealed or tilted.
+    pitch = np.deg2rad(18.0)
     rotate_x = np.array([[1, 0, 0], [0, np.cos(pitch), -np.sin(pitch)], [0, np.sin(pitch), np.cos(pitch)]])
-    vertices = vertices @ (rotate_y @ rotate_x).T
+    # Diffusion candidates can differ by a global yaw. Pick the informative
+    # thumbnail angle automatically so a handle/wing is not hidden behind the
+    # main body even though the actual GLB is complete.
+    yaw_candidates = np.deg2rad(np.arange(0.0, 180.0, 15.0))
+    yaw = max(
+        yaw_candidates,
+        key=lambda angle: float(
+            np.ptp(
+                (
+                    vertices
+                    @ np.array(
+                        [
+                            [np.cos(angle), 0, np.sin(angle)],
+                            [0, 1, 0],
+                            [-np.sin(angle), 0, np.cos(angle)],
+                        ]
+                    ).T
+                )[:, 0]
+            )
+        ),
+    )
+    rotate_y = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
+    vertices = vertices @ (rotate_x @ rotate_y).T
 
     triangles = vertices[faces]
     normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
@@ -657,8 +710,11 @@ def _render_model_preview(source: Path, output: Path) -> None:
     draw = ImageDraw.Draw(canvas)
     draw.ellipse((88, 372, width - 88, 425), fill="#0a1d19")
     screen = np.empty((len(triangles), 3, 2), dtype=np.float64)
-    screen[:, :, 0] = width / 2 + triangles[:, :, 0] * 0.76 * width
-    screen[:, :, 1] = height / 2 - triangles[:, :, 1] * 0.76 * height
+    # A single pixel scale preserves the actual aspect ratio.  Scaling X by
+    # width and Y by height made every thumbnail look ~56% too wide.
+    pixel_scale = 0.76 * min(width, height)
+    screen[:, :, 0] = width / 2 + triangles[:, :, 0] * pixel_scale
+    screen[:, :, 1] = height / 2 - triangles[:, :, 1] * pixel_scale
     depth = triangles[:, :, 2].mean(axis=1)
     light = np.array([-0.35, 0.65, 0.68], dtype=np.float64)
     light /= np.linalg.norm(light)
@@ -748,7 +804,10 @@ def _run_meshroom(db, job, project):
 def _clean_mask_components(mask: Image.Image) -> np.ndarray:
     from scipy import ndimage
 
-    values = np.asarray(mask.convert("L"), dtype=np.uint8) > 24
+    # Very low alpha values are commonly cast shadows rather than the object.
+    # A confidence threshold preserves soft anti-aliased edges without turning
+    # the studio floor into a foreground sheet.
+    values = np.asarray(mask.convert("L"), dtype=np.uint8) > 64
     labels, component_count = ndimage.label(values)
     if not component_count:
         return values
@@ -781,6 +840,7 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
         return 0
     input_images = sorted(images_dir.glob("*.jpg"))
     signature = {
+        "pipeline": MASK_PIPELINE_VERSION,
         "model": settings.segmentation_model,
         "images": [
             {"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -808,15 +868,20 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
     os.environ["U2NET_HOME"] = str(model_dir)
     masks_dir.mkdir(parents=True, exist_ok=True)
     created = 0
-    neural_pending: list[Path] = []
-    for image_path in input_images:
-        fast_mask = _fast_uniform_background_mask(image_path)
-        if fast_mask is None:
-            neural_pending.append(image_path)
-            continue
-        fast_mask.save(masks_dir / f"{image_path.name}.png")
-        fast_mask.save(masks_dir / f"{image_path.stem}.mask.png")
-        created += 1
+    # Quality-first models are deliberately run for every frame.  The former
+    # border-colour shortcut interpreted contact shadows as foreground on pale
+    # studio objects, which then became literal planes in the generated mesh.
+    neural_pending: list[Path] = list(input_images)
+    if settings.segmentation_model not in {"isnet-general-use", "birefnet-general"}:
+        neural_pending = []
+        for image_path in input_images:
+            fast_mask = _fast_uniform_background_mask(image_path)
+            if fast_mask is None:
+                neural_pending.append(image_path)
+                continue
+            fast_mask.save(masks_dir / f"{image_path.name}.png")
+            fast_mask.save(masks_dir / f"{image_path.stem}.mask.png")
+            created += 1
 
     if neural_pending:
         try:
@@ -834,8 +899,9 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
                 f"A segmentação não conseguiu isolar o objeto em {image_path.name}. "
                 "Usa um fundo simples e contrastante, sem outros objetos próximos."
             )
-        # Expand a few pixels to preserve the cup rim and thin handle edges.
-        mask = Image.fromarray((values * 255).astype(np.uint8), mode="L").filter(ImageFilter.MaxFilter(7))
+        # Expand only a narrow anti-aliased edge.  Larger dilation closes handle
+        # holes and makes thin structures look fused to the body.
+        mask = Image.fromarray((values * 255).astype(np.uint8), mode="L").filter(ImageFilter.MaxFilter(3))
         mask.save(masks_dir / f"{image_path.name}.png")
         mask.save(masks_dir / f"{image_path.stem}.mask.png")
         created += 1
@@ -889,6 +955,51 @@ def _fast_uniform_background_mask(image_path: Path) -> Image.Image | None:
     return mask
 
 
+def _estimated_stage_progress(elapsed_seconds: float, timeout_seconds: float) -> int:
+    """Return honest, bounded progress when a native tool emits no progress.
+
+    Native reconstruction tools often buffer stdout for minutes.  Advancing to
+    85% in a few seconds made a healthy but slow process look frozen.  The
+    estimate now follows elapsed time and never claims completion.
+    """
+    horizon = max(30.0, min(timeout_seconds * 0.8, 600.0))
+    ratio = min(1.0, max(0.0, elapsed_seconds) / horizon)
+    return min(85, 5 + round(80 * (ratio ** 0.7)))
+
+
+def _elapsed_label(elapsed_seconds: float, timeout_seconds: float | None) -> str:
+    elapsed = max(0, round(elapsed_seconds))
+    if elapsed < 60:
+        value = f"{elapsed} s"
+    else:
+        value = f"{elapsed // 60}:{elapsed % 60:02d} min"
+    if timeout_seconds is not None:
+        limit_minutes = max(1, round(timeout_seconds / 60))
+        return f"{value}; limite {limit_minutes} min"
+    return value
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Stop a native worker and its children so CPU/GPU memory is released."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
 def _run_stage_command(
     db,
     job,
@@ -902,6 +1013,8 @@ def _run_stage_command(
 ):
     _advance(db, job, stage, 5, message)
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    if os.name == "nt":
+        creation_flags |= subprocess.CREATE_NEW_PROCESS_GROUP
     process = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -935,22 +1048,15 @@ def _run_stage_command(
                 log.write(line)
                 log.flush()
                 tail.append(line.rstrip())
-            if stage.progress < 85:
-                _advance(db, job, stage, min(85, stage.progress + 2), message)
-            else:
-                elapsed_minutes = max(1, round((time.monotonic() - started) / 60))
-                _advance(db, job, stage, 85, f"{message} ({elapsed_minutes} min)")
-            if time.monotonic() - started > timeout:
+            elapsed = time.monotonic() - started
+            progress = _estimated_stage_progress(elapsed, timeout)
+            timing = _elapsed_label(elapsed, timeout_seconds)
+            _advance(db, job, stage, progress, f"{message} ({timing})")
+            if elapsed > timeout:
                 raise RuntimeError(f"A etapa '{stage.name}' excedeu o tempo máximo configurado.")
             time.sleep(2)
     finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        _terminate_process_tree(process)
     output_reader.join(timeout=5)
     while not output_queue.empty():
         line = output_queue.get_nowait()
@@ -969,6 +1075,68 @@ def _colmap_environment(executable: Path) -> dict:
     if plugin_dir.is_dir():
         env["QT_PLUGIN_PATH"] = str(plugin_dir)
     return env
+
+
+def _colmap_sift_cuda_available(colmap: Path) -> bool:
+    """Detect COLMAP's native SIFT CUDA path (independent of ONNX CUDA)."""
+    if shutil.which("nvidia-smi") is None:
+        return False
+    try:
+        gpu = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        build = subprocess.run(
+            [str(colmap), "-h"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return (
+        gpu.returncode == 0
+        and bool(gpu.stdout.strip())
+        and build.returncode == 0
+        and "with CUDA" in build.stdout
+    )
+
+
+def _colmap_matching_command(
+    colmap: Path,
+    database: Path,
+    models_root: Path,
+    camera_count: int,
+    use_gpu: bool,
+) -> list[str]:
+    """Build a bounded matcher for an ordered orbit around one object."""
+    overlap = max(6, min(10, (camera_count + 3) // 4))
+    command = [
+        str(colmap),
+        "sequential_matcher",
+        "--database_path", str(database),
+        "--FeatureMatching.type", "SIFT_BRUTEFORCE" if use_gpu else "ALIKED_LIGHTGLUE",
+        "--FeatureMatching.use_gpu", "1" if use_gpu else "0",
+        "--FeatureMatching.gpu_index", "0",
+        "--FeatureMatching.max_num_matches", "4096" if use_gpu else "2048",
+        "--SequentialMatching.overlap", str(overlap),
+        "--SequentialMatching.quadratic_overlap", "1",
+        "--SequentialMatching.loop_detection", "0",
+    ]
+    if not use_gpu:
+        command.extend([
+            "--AlikedMatching.lightglue_min_score", "0.08",
+            "--AlikedMatching.lightglue_model_path", str(models_root / "aliked-lightglue.onnx"),
+        ])
+    return command
 
 
 def _colmap_model_stats(text_model: Path) -> tuple[int, int]:
@@ -1115,25 +1283,120 @@ def _semantic_handle_order(images: list[Path], masks_dir: Path) -> list[Path] | 
     for image in images:
         hole = _mask_handle_hole(masks_dir / f"{image.stem}.mask.png")
         offset, area = hole if hole else (0.0, 0.0)
-        features.append((image, offset, area))
+        elevation = _view_internal_edge_imbalance(image, masks_dir / f"{image.stem}.mask.png")
+        features.append((image, offset, area, elevation))
     left = sorted((item for item in features if item[1] < -0.18), key=lambda item: item[2], reverse=True)
     right = sorted((item for item in features if item[1] > 0.18), key=lambda item: item[2], reverse=True)
-    neutral = [item for item in features if abs(item[1]) <= 0.18]
+    neutral = sorted(
+        (item for item in features if abs(item[1]) <= 0.18),
+        key=lambda item: item[3],
+    )
     if left and right and len(neutral) >= 2:
-        return [neutral[0][0], left[0][0], neutral[-1][0], right[0][0]]
+        return [neutral[0][0], left[0][0], neutral[1][0], right[0][0]]
     return None
 
 
-def _select_conditioning_views(images: list[Path], masks_dir: Path, limit: int = 4) -> list[Path]:
-    """Prefer a consistent lateral orbit, then sample it in capture order.
+def _semantic_handle_view_sets(
+    images: list[Path],
+    masks_dir: Path,
+    set_count: int,
+) -> list[list[Path]]:
+    """Build several valid front/left/back/right sets for handled objects.
+
+    Hunyuan2-mv has four fixed camera slots.  With a full orbit, using one
+    arbitrary image in each slot discards most of the evidence.  Repeated
+    handle observations let us create alternative, semantically ordered sets
+    and compare the resulting meshes instead.
+    """
+    features: list[tuple[Path, float, float, float]] = []
+    for image in images:
+        hole = _mask_handle_hole(masks_dir / f"{image.stem}.mask.png")
+        offset, area = hole if hole else (0.0, 0.0)
+        elevation = _view_internal_edge_imbalance(image, masks_dir / f"{image.stem}.mask.png")
+        features.append((image, offset, area, elevation))
+    left = sorted((item for item in features if item[1] < -0.18), key=lambda item: item[2], reverse=True)
+    right = sorted((item for item in features if item[1] > 0.18), key=lambda item: item[2], reverse=True)
+    neutral = sorted(
+        (item for item in features if abs(item[1]) <= 0.18),
+        key=lambda item: item[3],
+    )
+    if not left or not right or len(neutral) < 2:
+        return []
+
+    # Prefer the most level neutral silhouettes.  Cycling a small trusted pool
+    # gives front/back evidence without eventually selecting a top-down view
+    # merely because it appeared late in the upload order.
+    neutral = neutral[: max(2, min(len(neutral), set_count))]
+
+    groups: list[list[Path]] = []
+    for index in range(max(1, set_count * 2)):
+        front = neutral[index % len(neutral)][0]
+        back = neutral[(index + 1) % len(neutral)][0]
+        group = [front, left[index % len(left)][0], back, right[index % len(right)][0]]
+        if len(set(group)) == 4 and group not in groups:
+            groups.append(group)
+        if len(groups) >= set_count:
+            break
+    return groups
+
+
+def _select_conditioning_view_sets(
+    images: list[Path],
+    masks_dir: Path,
+    set_count: int = 3,
+    limit: int = 4,
+) -> list[list[Path]]:
+    """Use a full orbit through complementary four-view diffusion passes."""
+    if not images:
+        return []
+    if len(images) <= limit:
+        return [_select_conditioning_views(images, masks_dir, limit)]
+
+    requested = max(1, min(set_count, max(1, len(images) // limit)))
+    # Hunyuan2-mv interprets its four inputs as a horizontal camera orbit.
+    # Top/base images are still valuable validation evidence, but feeding one
+    # into a lateral slot can rotate, close or squash an otherwise good object.
+    orbit = _lateral_conditioning_orbit(images, masks_dir, limit)
+    semantic = _semantic_handle_view_sets(orbit, masks_dir, requested)
+    groups: list[list[Path]] = [*semantic]
+
+    # Generic fallback: phase-shift four evenly spaced samples through the
+    # upload orbit.  The primary selector remains the first group because it
+    # excludes obvious top/base outliers and preserves backwards behaviour.
+    primary = _select_conditioning_views(images, masks_dir, limit)
+    if primary and primary not in groups:
+        groups.insert(0, primary)
+    count = len(orbit)
+    for phase in range(requested * 3):
+        offset = (phase + 1) * count / (limit * max(requested, 1))
+        indices = [int(round(offset + slot * count / limit)) % count for slot in range(limit)]
+        group = [orbit[index] for index in indices]
+        semantic_group = _semantic_handle_order(group, masks_dir) if limit == 4 else None
+        if semantic_group:
+            group = semantic_group
+        if len(set(group)) == limit and group not in groups:
+            groups.append(group)
+        if len(groups) >= requested:
+            break
+    return groups[:requested] or [primary]
+
+
+def _lateral_conditioning_orbit(
+    images: list[Path],
+    masks_dir: Path,
+    limit: int = 4,
+) -> list[Path]:
+    """Return the consistent lateral orbit without top/base outliers.
 
     A capture often includes useful top and inverted-base shots.  Those improve
     confidence, but mixing one of them into the four fixed Hunyuan side slots can
     distort the generated body.  Foreground shape gives us a cheap, category-
-    independent way to keep the dominant orbit while still preserving its order.
+    independent way to keep the dominant orbit while preserving upload order.
     """
+    if not images:
+        return []
     if len(images) <= limit:
-        return images
+        return list(images)
     signatures = [
         _mask_shape_signature(masks_dir / f"{image.stem}.mask.png")
         for image in images
@@ -1155,7 +1418,7 @@ def _select_conditioning_views(images: list[Path], masks_dir: Path, limit: int =
     edge_balanced = {
         index
         for index, image in enumerate(images)
-        if _view_internal_edge_imbalance(image, masks_dir / f"{image.stem}.mask.png") <= 0.38
+        if _view_internal_edge_imbalance(image, masks_dir / f"{image.stem}.mask.png") <= 0.32
     }
     if len(upright & edge_balanced) >= limit:
         upright &= edge_balanced
@@ -1170,7 +1433,34 @@ def _select_conditioning_views(images: list[Path], masks_dir: Path, limit: int =
         consistency = np.abs(np.log(np.maximum(heights, 1e-6) / median_height))
         consistency += np.abs(np.log(np.maximum(aspects, 1e-6) / median_aspect))
         consistent = sorted(np.argsort(consistency)[: max(limit, round(len(images) * 0.55))].tolist())
-    orbit = [images[index] for index in consistent]
+    return [images[index] for index in consistent]
+
+
+def _select_conditioning_views(images: list[Path], masks_dir: Path, limit: int = 4) -> list[Path]:
+    """Prefer a consistent lateral orbit, then sample it in capture order."""
+    if not images:
+        return []
+    if len(images) <= limit:
+        if len(images) == 4:
+            semantic_order = _semantic_handle_order(images, masks_dir)
+            if semantic_order:
+                return semantic_order
+        # The primary upload is not necessarily a front view. Prefer the most
+        # lateral-looking silhouette as the front anchor and keep the remaining
+        # user order. This prevents a top/base shot from defining the object.
+        signatures = [_mask_shape_signature(masks_dir / f"{image.stem}.mask.png") for image in images]
+        aspects = np.asarray([signature[1] for signature in signatures], dtype=float)
+        median_aspect = max(float(np.median(aspects)), 1e-6)
+        asymmetries = np.asarray(
+            [_mask_vertical_asymmetry(masks_dir / f"{image.stem}.mask.png") for image in images],
+            dtype=float,
+        )
+        lateral_scores = asymmetries - 0.22 * np.abs(
+            np.log(np.maximum(aspects, 1e-6) / median_aspect)
+        )
+        anchor = int(np.argmax(lateral_scores))
+        return [images[anchor], *[image for index, image in enumerate(images) if index != anchor]]
+    orbit = _lateral_conditioning_orbit(images, masks_dir, limit)
     if limit == 4:
         semantic_order = _semantic_handle_order(orbit, masks_dir)
         if semantic_order:
@@ -1213,23 +1503,45 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     _advance(db, job, stages[0], 100, f"{image_count} imagens e {mask_count} máscaras preparadas")
 
     candidates = sorted(images_dir.glob("image-*.jpg"))
-    selected = _select_conditioning_views(candidates, masks_dir, 4)
-    if project.project_type in {"ai_references", "hybrid"}:
-        primary_path = images_dir / "image-0000.jpg"
-        if primary_path.is_file():
-            selected = [primary_path, *[image for image in selected if image != primary_path]][:4]
-    selected_masks = [masks_dir / f"{image.stem}.mask.png" for image in selected]
-    if any(not mask.is_file() for mask in selected_masks):
+    all_masks = [masks_dir / f"{image.stem}.mask.png" for image in candidates]
+    if any(not mask.is_file() for mask in all_masks):
         raise RuntimeError("Não foi possível segmentar vistas suficientes para a reconstrução por IA.")
-    _advance(db, job, stages[1], 100, f"{len(selected)} vistas complementares selecionadas")
-    _advance(db, job, stages[2], 100, "A IA vai estimar câmaras e superfícies ocultas")
-    _advance(db, job, stages[3], 100, "Nuvem clássica substituída por representação generativa")
 
     raw_output = workspace / "hunyuan-raw.glb"
     model_cache = _resolved_tool_root(settings.hunyuan_model_cache)
     model_cache.mkdir(parents=True, exist_ok=True)
     texture_model = _hunyuan_texture_runtime(python)
-    generated_candidates = 4 if image_count <= 10 else 2
+    quality_profile = str((job.configuration or {}).get("quality_profile", "standard"))
+    generated_candidates = {"preview": 3, "standard": 8, "high": 8}.get(quality_profile, 8)
+    requested_sets = {"preview": 2, "standard": 3, "high": 4}.get(quality_profile, 3)
+    view_sets = _select_conditioning_view_sets(candidates, masks_dir, requested_sets, 4)
+    if not view_sets or any(len(group) == 0 for group in view_sets):
+        raise RuntimeError("Não foi possível criar conjuntos angulares coerentes para a IA.")
+    image_index = {image: index for index, image in enumerate(candidates)}
+    group_indices = [[image_index[image] for image in group] for group in view_sets]
+    conditioning_view_count = len({image for group in view_sets for image in group})
+    manifest_path = workspace / "conditioning-manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "images": [str(image) for image in candidates],
+                "masks": [str(mask) for mask in all_masks],
+                "view_groups": group_indices,
+                "view_group_names": [[image.name for image in group] for group in view_sets],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _advance(
+        db,
+        job,
+        stages[1],
+        100,
+        f"{conditioning_view_count} vistas em {len(view_sets)} conjuntos angulares selecionadas",
+    )
+    _advance(db, job, stages[2], 100, "A IA vai comparar hipóteses de câmara e superfícies ocultas")
+    _advance(db, job, stages[3], 100, "Todas as silhuetas vão validar a representação generativa")
     target_faces = int((job.configuration or {}).get("target_faces", 60000))
     command = [
         str(python), str(generator),
@@ -1242,8 +1554,9 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         "--resolution", "256",
         "--candidates", str(generated_candidates),
         "--target-faces", str(target_faces),
-        "--images", *[str(image) for image in selected],
-        "--masks", *[str(mask) for mask in selected_masks],
+        "--category", project.category,
+        "--project-colors",
+        "--manifest", str(manifest_path),
     ]
     if texture_model:
         command.extend(["--texture", "--texture-model", str(texture_model)])
@@ -1251,12 +1564,15 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         **(job.configuration or {}),
         "engine": "Hunyuan3D-2mv Turbo",
         "strategy_key": strategy_key,
-        "conditioning_views": [image.name for image in selected],
+        "conditioning_views": sorted({image.name for group in view_sets for image in group}),
+        "conditioning_view_sets": [[image.name for image in group] for group in view_sets],
+        "validation_views": len(candidates),
         "candidate_count": generated_candidates,
         "target_faces": target_faces,
         "generative_ai": True,
-        "ai_texturing": bool(texture_model),
-        "ai_texturing_reason": "ready" if texture_model else "native rasterizer or local paint model unavailable",
+        "ai_texturing": True,
+        "ai_texture_engine": "Hunyuan Paint" if texture_model else "Local multiview UV baker",
+        "ai_texturing_reason": "ready" if texture_model else "portable CPU UV atlas fallback",
     }
     db.commit()
     with log_path.open("w", encoding="utf-8") as log:
@@ -1274,8 +1590,25 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         raise RuntimeError("A IA terminou sem produzir uma malha 3D utilizável.")
     worker_result = _read_hunyuan_result(log_path)
     material_mode = str(worker_result.get("material", "pbr_uniform"))
-    texture_generated = material_mode == "hunyuan_paint_multiview"
-    _advance(db, job, stages[5], 100, "Textura multivista gerada" if texture_generated else "Material PBR coerente aplicado")
+    result_tier = str(worker_result.get("result_tier", "ai_assisted"))
+    recovery_mode = str(worker_result.get("recovery_mode", "none"))
+    recovery_warnings = [
+        str(value)
+        for value in worker_result.get("recovery_warnings", [])
+        if str(value).strip()
+    ]
+    texture_generated = material_mode in {
+        "hunyuan_paint_multiview",
+        "multiview_uv_texture",
+        "multiview_vertex_color",
+    }
+    texture_label = {
+        "hunyuan_paint_multiview": "Textura UV multivista",
+        "multiview_uv_texture": "Textura UV multivista local",
+        "multiview_vertex_color": "Cores multivista projetadas",
+    }.get(material_mode, "Material PBR uniforme")
+    tier_label = " · aproximação segura" if result_tier == "estimated" else ""
+    _advance(db, job, stages[5], 100, f"{texture_label} aplicado{tier_label}")
 
     _advance(db, job, stages[6], 20, "A normalizar e exportar o GLB…")
     glb_path = artifacts_dir / f"{job.id}.glb"
@@ -1287,8 +1620,19 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
 
     trackability = photogrammetry_trackability(project.images)
     estimates = capture_metrics(image_count, project.validation_score, trackability["level"], project.project_type)
-    confidence = estimates["geometric_confidence_estimate"]
-    if strategy_key == "hybrid_fallback":
+    candidate_score = float(worker_result.get("candidate_score", 0))
+    integrity_confidence = round(
+        min(100.0, candidate_score) * 0.72
+        + float(worker_result.get("main_face_ratio", 0)) * 28
+    )
+    confidence = min(estimates["geometric_confidence_estimate"], integrity_confidence)
+    if result_tier == "estimated":
+        # A proxy is useful and displayable, but it is not evidence of detailed
+        # geometry. Never let input count inflate its confidence.
+        confidence = min(confidence, 35)
+    elif recovery_mode == "mesh_repair":
+        confidence = max(25, confidence - 6)
+    if strategy_key.endswith("_fallback"):
         attempt = (job.configuration or {}).get("photogrammetry_attempt", {})
         aligned = int(attempt.get("registered", 0) or 0)
         attempted = int(attempt.get("images", image_count) or image_count)
@@ -1304,7 +1648,7 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         project,
         glb_path,
         {
-            "cameras": len(selected),
+            "cameras": conditioning_view_count,
             "input_images": image_count,
             "points": 0,
             **geometry,
@@ -1314,12 +1658,24 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "geometric_confidence": confidence,
             "observed_coverage": estimates["observed_coverage_estimate"],
             "candidates_generated": int(worker_result.get("candidate_count", generated_candidates)),
+            "candidates_attempted": int(worker_result.get("attempted_candidates", generated_candidates)),
             "selected_candidate": int(worker_result.get("selected_candidate", 1)),
-            "candidate_score": float(worker_result.get("candidate_score", 0)),
+            "candidate_score": candidate_score,
+            "result_tier": result_tier,
+            "recovery_mode": recovery_mode,
+            "recovery_warnings": recovery_warnings,
+            "estimated_geometry": result_tier == "estimated",
+            "inferred_geometry": True,
+            "main_component_ratio": float(worker_result.get("main_face_ratio", 0)),
+            "significant_components": int(worker_result.get("significant_components", 0)),
+            "dominant_sheet_ratio": float(worker_result.get("dominant_sheet_ratio", 0)),
+            "silhouette_evidence": float(worker_result.get("silhouette_evidence", 0)),
+            "all_view_silhouette": float(worker_result.get("all_view_silhouette", 0)),
             "handle_expected": bool(worker_result.get("handle_expected", False)),
             "handle_preserved": bool(worker_result.get("handle_preserved", False)),
+            "surface_smoothed": bool(worker_result.get("surface_smoothed", False)),
             "triangles_before_optimization": int(worker_result.get("faces_before_optimization", geometry["triangles"])),
-            "texture_mode": "Textura UV multivista" if texture_generated else "PBR base sem textura gerada",
+            "texture_mode": texture_label,
             "texture_generated": texture_generated,
             "photogrammetry_trackability": trackability["score"],
             "quality_score": estimates["visual_fidelity_estimate"],
@@ -1330,12 +1686,19 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "generative_ai": True,
             "engine": "Hunyuan3D-2mv Turbo multi-candidato + PBR",
             "strategy": strategy_key,
-            "estimated_geometry": True,
-            "conditioning_views": len(selected),
+            "result_tier": result_tier,
+            "recovery_mode": recovery_mode,
+            "recovery_warnings": recovery_warnings,
+            "estimated_geometry": result_tier == "estimated",
+            "inferred_geometry": True,
+            "conditioning_views": conditioning_view_count,
+            "conditioning_view_sets": len(view_sets),
+            "validation_views": len(candidates),
             "candidates_generated": int(worker_result.get("candidate_count", generated_candidates)),
             "selected_candidate": int(worker_result.get("selected_candidate", 1)),
             "material": material_mode,
             "texture_projection": texture_generated,
+            "surface_smoothed": bool(worker_result.get("surface_smoothed", False)),
             "optimized_target_faces": target_faces,
             "source_format": ".glb",
         },
@@ -1382,6 +1745,14 @@ def _run_colmap(db, job, project):
 
     colmap_env = _colmap_environment(colmap)
     models_root = colmap.parent.parent
+    use_colmap_gpu = _colmap_sift_cuda_available(colmap)
+    job.configuration = {
+        **(job.configuration or {}),
+        "photogrammetry_acceleration": "cuda_sift" if use_colmap_gpu else "cpu_aliked",
+        "matching_strategy": "sequential_quadratic",
+        "matching_timeout_seconds": 300,
+    }
+    db.commit()
     with log_path.open("w", encoding="utf-8") as log:
         feature_command = [
             str(colmap), "feature_extractor",
@@ -1389,26 +1760,31 @@ def _run_colmap(db, job, project):
             "--image_path", str(images_dir),
             "--ImageReader.camera_model", "PINHOLE",
             "--ImageReader.single_camera", "1",
-            "--FeatureExtraction.type", "ALIKED_N16ROT",
-            "--FeatureExtraction.use_gpu", "0",
-            "--FeatureExtraction.max_image_size", "2048",
-            "--AlikedExtraction.max_num_features", "4096",
-            "--AlikedExtraction.min_score", "0.1",
-            "--AlikedExtraction.n16rot_model_path", str(models_root / "aliked-n16rot.onnx"),
+            "--FeatureExtraction.type", "SIFT" if use_colmap_gpu else "ALIKED_N16ROT",
+            "--FeatureExtraction.use_gpu", "1" if use_colmap_gpu else "0",
+            "--FeatureExtraction.gpu_index", "0",
+            "--FeatureExtraction.max_image_size", "1600",
         ]
+        if use_colmap_gpu:
+            feature_command.extend(["--SiftExtraction.max_num_features", "4096"])
+        else:
+            feature_command.extend([
+                "--AlikedExtraction.max_num_features", "2048",
+                "--AlikedExtraction.min_score", "0.1",
+                "--AlikedExtraction.n16rot_model_path", str(models_root / "aliked-n16rot.onnx"),
+            ])
         if mask_count:
             feature_command.extend(["--ImageReader.mask_path", str(masks_dir)])
-        _run_stage_command(db, job, stages[1], feature_command, "A extrair detalhes visuais do objeto…", log, workspace, colmap_env)
+        _run_stage_command(
+            db, job, stages[1], feature_command,
+            "A extrair detalhes visuais do objeto…", log, workspace, colmap_env,
+            timeout_seconds=300,
+        )
         _run_stage_command(
             db, job, stages[1],
-            [
-                str(colmap), "exhaustive_matcher", "--database_path", str(database),
-                "--FeatureMatching.type", "ALIKED_LIGHTGLUE", "--FeatureMatching.use_gpu", "0",
-                "--FeatureMatching.max_num_matches", "8192",
-                "--AlikedMatching.lightglue_min_score", "0.05",
-                "--AlikedMatching.lightglue_model_path", str(models_root / "aliked-lightglue.onnx"),
-            ],
-            "A comparar todos os pares de fotografias…", log, workspace, colmap_env,
+            _colmap_matching_command(colmap, database, models_root, camera_count, use_colmap_gpu),
+            "A ligar vistas vizinhas e complementares…", log, workspace, colmap_env,
+            timeout_seconds=300,
         )
         _run_stage_command(
             db, job, stages[2],
@@ -1419,6 +1795,7 @@ def _run_colmap(db, job, project):
                 "--Mapper.ba_refine_principal_point", "1", "--Mapper.max_num_models", "1",
             ],
             "A estimar posições de câmara e geometria esparsa…", log, workspace, colmap_env,
+            timeout_seconds=300,
         )
         model_dir = sparse_dir / "0"
         if not model_dir.is_dir():
@@ -1429,6 +1806,7 @@ def _run_colmap(db, job, project):
             db, job, stages[2],
             [str(colmap), "model_converter", "--input_path", str(model_dir), "--output_path", str(text_model), "--output_type", "TXT"],
             "A verificar câmaras reconstruídas…", log, workspace, colmap_env,
+            timeout_seconds=60,
         )
         registered, sparse_points = _colmap_model_stats(text_model)
         job.configuration = {

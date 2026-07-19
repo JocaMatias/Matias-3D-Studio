@@ -1,32 +1,56 @@
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 import numpy as np
+import trimesh
 
-from app.reconstruction import _fast_uniform_background_mask, _select_conditioning_views, _semantic_handle_order
-from app.strategy import capture_metrics, strategy_for_images
+from app.config import PROJECT_ROOT
+from app.reconstruction import (
+    _convert_to_glb,
+    _fast_uniform_background_mask,
+    _select_conditioning_view_sets,
+    _select_conditioning_views,
+    _semantic_handle_order,
+)
+from app.strategy import capture_metrics, strategy_for_images, strategy_for_project
 from app.validation import photogrammetry_trackability
+
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from mesh_texturing import apply_multiview_vertex_colours
 
 
 def test_progressive_strategy_thresholds():
-    assert strategy_for_images(4).key == "insufficient"
-    assert strategy_for_images(5).key == "ai_multiview"
-    assert strategy_for_images(10).key == "ai_multiview"
-    assert strategy_for_images(11).key == "ai_refined"
-    assert strategy_for_images(19).key == "ai_refined"
-    assert strategy_for_images(20).key == "ai_refined"
-    assert strategy_for_images(20, "low").key == "ai_refined"
-    assert strategy_for_images(20, "high").key == "hybrid"
+    assert strategy_for_images(0).key == "insufficient"
+    assert strategy_for_images(1).key == "ai_multiview"
+    assert strategy_for_images(4).key == "ai_multiview"
+    assert strategy_for_images(5).key == "hybrid"
+    assert strategy_for_images(15).key == "hybrid"
+    # 16-19 is an intentional transition range: hybrid remains available and
+    # the UI recommends adding views until precise scanning unlocks at 20.
+    assert strategy_for_images(19).key == "hybrid"
+    assert strategy_for_images(20, "low").key == "precision_scan"
+    assert strategy_for_images(20, "high").key == "precision_scan"
+
+
+def test_explicit_modes_enforce_their_own_minimums():
+    assert strategy_for_project("ai_multiview", 1).key == "ai_multiview"
+    assert strategy_for_project("hybrid", 4).key == "insufficient"
+    assert strategy_for_project("hybrid", 5).key == "hybrid"
+    assert strategy_for_project("precision_scan", 19).key == "insufficient"
+    assert strategy_for_project("precision_scan", 20).key == "precision_scan"
 
 
 def test_more_images_raise_geometric_confidence():
-    five = capture_metrics(5, 70)
-    ten = capture_metrics(10, 70)
-    nineteen = capture_metrics(19, 70)
-    assert five["geometric_confidence_estimate"] < ten["geometric_confidence_estimate"]
-    assert ten["geometric_confidence_estimate"] < nineteen["geometric_confidence_estimate"]
-    assert five["visual_fidelity_estimate"] < ten["visual_fidelity_estimate"] < 90
+    one = capture_metrics(1, 70, project_type="ai_multiview")
+    four = capture_metrics(4, 70, project_type="ai_multiview")
+    five = capture_metrics(5, 70, project_type="hybrid")
+    fifteen = capture_metrics(15, 70, project_type="hybrid")
+    twenty = capture_metrics(20, 70, "high", "precision_scan")
+    assert one["geometric_confidence_estimate"] < four["geometric_confidence_estimate"]
+    assert five["geometric_confidence_estimate"] < fifteen["geometric_confidence_estimate"]
+    assert fifteen["geometric_confidence_estimate"] < twenty["geometric_confidence_estimate"]
 
 
 def test_handle_views_are_put_in_opposite_multiview_slots(tmp_path: Path):
@@ -54,18 +78,21 @@ def test_handle_views_are_put_in_opposite_multiview_slots(tmp_path: Path):
     assert selected == images
 
 
-def test_smooth_object_stays_on_ai_even_with_many_images():
+def test_smooth_object_uses_precise_mode_with_generative_fallback():
     images = [SimpleNamespace(blur_score=22.0, validation_status="approved") for _ in range(24)]
     trackability = photogrammetry_trackability(images)
     assert trackability["level"] == "low"
-    assert strategy_for_images(len(images), trackability["level"]).key == "ai_refined"
+    strategy = strategy_for_images(len(images), trackability["level"])
+    assert strategy.key == "precision_scan"
+    assert strategy.uses_photogrammetry is True
+    assert strategy.uses_generative_ai is True
 
 
 def test_detailed_object_can_enable_hybrid_pipeline():
     images = [SimpleNamespace(blur_score=65.0, validation_status="approved") for _ in range(24)]
     trackability = photogrammetry_trackability(images)
     assert trackability["level"] == "high"
-    assert strategy_for_images(len(images), trackability["level"]).key == "hybrid"
+    assert strategy_for_images(len(images), trackability["level"]).key == "precision_scan"
 
 
 def test_uniform_studio_background_uses_fast_local_mask(tmp_path: Path):
@@ -102,3 +129,44 @@ def test_conditioning_views_keep_the_dominant_lateral_orbit(tmp_path: Path):
         "image-0004.jpg",
         "image-0009.jpg",
     ]
+
+
+def test_conditioning_view_sets_use_distinct_parts_of_a_full_orbit(tmp_path: Path):
+    images = [tmp_path / f"image-{index:04d}.jpg" for index in range(16)]
+    for index, image in enumerate(images):
+        Image.new("RGB", (96, 96), (180 + index, 180, 180)).save(image)
+        mask = Image.new("L", (96, 96), 0)
+        ImageDraw.Draw(mask).ellipse((18 + index % 3, 20, 76, 78), fill=255)
+        mask.save(tmp_path / f"{image.stem}.mask.png")
+
+    groups = _select_conditioning_view_sets(images, tmp_path, set_count=3, limit=4)
+
+    assert len(groups) == 3
+    assert all(len(set(group)) == 4 for group in groups)
+    assert len({tuple(group) for group in groups}) == 3
+    assert len({image for group in groups for image in group}) >= 8
+
+
+def test_multiview_colours_survive_glb_normalization(tmp_path: Path):
+    mesh = trimesh.creation.icosphere(subdivisions=2)
+    views = [
+        Image.new("RGBA", (64, 64), color)
+        for color in ("red", "green", "blue", "gold")
+    ]
+    apply_multiview_vertex_colours(
+        mesh,
+        views,
+        np.array([220, 220, 220, 255], dtype=np.uint8),
+    )
+    source = tmp_path / "coloured-source.glb"
+    output = tmp_path / "coloured-normalized.glb"
+    mesh.export(source)
+    _convert_to_glb(source, output)
+
+    scene = trimesh.load(output, force="scene", process=False)
+    colours = np.concatenate(
+        [geometry.visual.vertex_colors[:, :3] for geometry in scene.geometry.values()],
+        axis=0,
+    )
+    assert len(np.unique(colours, axis=0)) >= 3
+    assert not np.all(colours == 255)

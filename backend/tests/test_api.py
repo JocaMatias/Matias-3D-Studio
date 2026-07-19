@@ -1,9 +1,8 @@
 import io
-import time
 from PIL import Image
 from fastapi.testclient import TestClient
+import pytest
 from app.main import app
-from app.config import settings
 
 
 client = TestClient(app)
@@ -15,10 +14,24 @@ def image_bytes():
     return output.getvalue()
 
 
+def test_health_contract_identifies_the_current_desktop_api():
+    with client:
+        health = client.get("/api/health")
+        assert health.status_code == 200
+        assert health.json()["api_version"] == "0.3.0"
+        assert health.json()["generation_modes"] == [
+            "ai_multiview",
+            "hybrid",
+            "precision_scan",
+        ]
+
+
 def test_vertical_project_flow():
     with client:
-        settings.reconstruction_mode = "mock"
-        created = client.post("/api/projects", json={"name": "Teste", "capture_type": "small_object"})
+        created = client.post(
+            "/api/projects",
+            json={"name": "Teste", "capture_type": "small_object", "project_type": "ai_multiview"},
+        )
         assert created.status_code == 201
         project_id = created.json()["id"]
         upload = client.post(f"/api/projects/{project_id}/images", files=[("files", ("object.jpg", image_bytes(), "image/jpeg"))])
@@ -26,16 +39,14 @@ def test_vertical_project_flow():
         report = client.post(f"/api/projects/{project_id}/validate")
         assert report.status_code == 200
         assert 0 <= report.json()["score"] <= 100
-        settings.mock_stage_seconds = 0.01
         started = client.post(f"/api/projects/{project_id}/reconstruct")
         assert started.status_code == 202
-        for _ in range(150):
-            job = client.get(f"/api/projects/{project_id}/job").json()
-            if job["status"] == "completed":
-                break
-            time.sleep(0.02)
+        # QUEUE_MODE=inline executes the complete job inside the request. This
+        # makes a stuck `processing` state a deterministic regression failure.
+        job = started.json()
         assert job["status"] == "completed"
         assert job["progress"] == 100
+        assert job["queue_id"].startswith("inline:")
         artifacts = client.get(f"/api/projects/{project_id}/artifacts").json()
         glb = next(artifact for artifact in artifacts if artifact["artifact_type"] == "glb")
         assert any(artifact["artifact_type"] == "preview" for artifact in artifacts)
@@ -48,4 +59,30 @@ def test_vertical_project_flow():
         preview = client.get(f"/api/projects/{project_id}/preview")
         assert preview.status_code == 200
         assert preview.headers["content-type"].startswith("image/jpeg")
+        client.delete(f"/api/projects/{project_id}")
+
+
+@pytest.mark.parametrize(
+    ("project_type", "minimum"),
+    [("hybrid", 5), ("precision_scan", 20)],
+)
+def test_generation_mode_minimum_is_enforced_in_inline_test_queue(project_type, minimum):
+    with client:
+        created = client.post(
+            "/api/projects",
+            json={"name": "Modo incompleto", "capture_type": "small_object", "project_type": project_type},
+        )
+        assert created.status_code == 201
+        project_id = created.json()["id"]
+        upload = client.post(
+            f"/api/projects/{project_id}/images",
+            files=[("files", ("object.jpg", image_bytes(), "image/jpeg"))],
+        )
+        assert upload.status_code == 201
+        assert client.post(f"/api/projects/{project_id}/validate").status_code == 200
+
+        started = client.post(f"/api/projects/{project_id}/reconstruct")
+        assert started.status_code == 409
+        assert f"pelo menos {minimum}" in started.json()["detail"]
+        assert client.get(f"/api/projects/{project_id}/job").status_code == 404
         client.delete(f"/api/projects/{project_id}")

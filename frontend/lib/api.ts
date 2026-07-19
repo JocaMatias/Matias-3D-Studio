@@ -1,6 +1,6 @@
 export const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
-export type ProjectType = "real_photos" | "ai_references" | "hybrid";
+export type ProjectType = "ai_multiview" | "hybrid" | "precision_scan";
 export type Project = {
   id: string;
   name: string;
@@ -69,6 +69,29 @@ export type Artifact = {
 };
 export type Engine = { mode: string; available: boolean; real_reconstruction: boolean; message: string; pipeline?: string | null };
 
+function apiErrorMessage(detail: unknown): string {
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail.map((item) => {
+      if (typeof item === "string") return item;
+      if (!item || typeof item !== "object") return "";
+      const value = item as { msg?: unknown; loc?: unknown };
+      const message = typeof value.msg === "string" ? value.msg.replace(/^Value error,\s*/i, "") : "Dados inválidos";
+      const location = Array.isArray(value.loc)
+        ? value.loc.filter((part) => part !== "body").map(String).join(" → ")
+        : "";
+      return location ? `${location}: ${message}` : message;
+    }).filter(Boolean);
+    if (messages.length) return messages.join(" · ");
+  }
+  if (detail && typeof detail === "object") {
+    const value = detail as { message?: unknown; msg?: unknown };
+    if (typeof value.message === "string") return value.message;
+    if (typeof value.msg === "string") return value.msg;
+  }
+  return "O pedido foi recusado pela API. Confirma os dados e reinicia a aplicação se tiver sido atualizada.";
+}
+
 export async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, {
     ...options,
@@ -81,8 +104,8 @@ export async function request<T>(path: string, options?: RequestInit): Promise<T
   if (!response.ok) {
     let message = "Ocorreu um erro inesperado.";
     try {
-      const error = await response.json();
-      message = error.detail || message;
+      const error = await response.json() as { detail?: unknown };
+      message = apiErrorMessage(error.detail);
     } catch {}
     throw new Error(message);
   }
@@ -102,7 +125,7 @@ export const statusLabel: Record<string, string> = {
   cancelled: "Cancelado",
 };
 export const projectTypeLabel: Record<string, string> = {
-  real_photos: "Fotos reais",
-  ai_references: "Referências IA",
-  hybrid: "Híbrido",
+  ai_multiview: "IA Multivista",
+  hybrid: "Reconstrução híbrida",
+  precision_scan: "Digitalização precisa",
 };

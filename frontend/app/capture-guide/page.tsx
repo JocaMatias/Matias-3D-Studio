@@ -1,26 +1,26 @@
 import Link from "next/link";
-import { Aperture, ArrowRight, Camera, CircleDot, Images, Lightbulb, ScanLine, Sparkles } from "lucide-react";
+import { Aperture, ArrowRight, CircleDot, Images, Layers3, Lightbulb, ScanLine, Sparkles } from "lucide-react";
 
 const steps = [
   ["1", "Escolhe um fundo simples", "Usa um fundo mate e diferente da cor do objeto. Evita padrões que possam ser confundidos com a geometria."],
   ["2", "Ilumina sem reflexos", "Prefere duas luzes suaves e constantes. Desliga o flash; brilho especular e sombras duras dificultam a correspondência."],
   ["3", "Mantém a escala", "Não alteres o zoom. Move a câmara à volta do objeto e mantém-no completo e centrado em todas as vistas."],
-  ["4", "Cobre a forma", "Com cinco imagens inclui frente, traseira, ambos os lados e uma vista superior. Acrescenta ângulos intermédios para maior precisão."],
+  ["4", "Cobre a forma", "Com 1–4 imagens escolhe vistas complementares. Para 5–15 cobre frente, traseira, lados e topo. Com 20+ cria duas voltas sobrepostas."],
 ];
 
 export default function CaptureGuide() {
   return (
     <main className="shell" style={{ paddingBottom: 70 }}>
       <header className="guide-hero">
-        <h1>Cinco boas vistas para começar. Mais ângulos para aperfeiçoar.</h1>
-        <p className="sub" style={{ fontSize: 18 }}>O estúdio adapta o motor ao material enviado. A qualidade depende mais da cobertura e consistência do que de um número rígido de fotografias.</p>
+        <h1>De uma boa referência a uma digitalização precisa.</h1>
+        <p className="sub" style={{ fontSize: 18 }}>Escolhe o modo pela cobertura disponível. Ângulos realmente novos e consistentes valem mais do que imagens repetidas.</p>
         <div className="actions"><Link className="btn primary" href="/projects/new">Criar projeto <ArrowRight size={17} /></Link></div>
       </header>
 
       <section className="grid3 guide-section">
-        <article className="card"><Camera color="var(--mint)" /><h3>Fotografias reais</h3><p className="sub">Todas as vistas devem mostrar exatamente o mesmo objeto, iluminação e estado.</p></article>
-        <article className="card"><Sparkles color="var(--mint)" /><h3>Referências de IA</h3><p className="sub">Escolhe uma imagem principal e confirma que detalhes, proporções e materiais não mudam entre vistas.</p></article>
-        <article className="card"><ScanLine color="var(--mint)" /><h3>Modo híbrido</h3><p className="sub">As fotografias reais ancoram a geometria; as referências adicionais ajudam apenas nas zonas sem cobertura.</p></article>
+        <article className="card"><Sparkles color="var(--mint)" /><h3>IA Multivista · 1–4</h3><p className="sub">Uma vista já funciona; vistas opostas reduzem a geometria que precisa de ser inferida.</p></article>
+        <article className="card"><Layers3 color="var(--mint)" /><h3>Reconstrução híbrida · 5–15</h3><p className="sub">A cobertura observada ancora a forma e as cores; a IA completa apenas as zonas ocultas.</p></article>
+        <article className="card"><ScanLine color="var(--mint)" /><h3>Digitalização precisa · 20+</h3><p className="sub">Duas voltas sobrepostas permitem recuperar câmaras reais, detalhe denso e textura projetada.</p></article>
       </section>
 
       <section className="guide-section">
@@ -40,9 +40,9 @@ export default function CaptureGuide() {
           <div className="eyebrow">Cobertura recomendada</div>
           <h2>O que muda quando adicionas imagens?</h2>
           <ul className="checklist">
-            <li><strong>5 vistas:</strong>&nbsp;base utilizável para objetos simples e referências consistentes.</li>
-            <li><strong>8–12 vistas:</strong>&nbsp;melhor leitura de saliências, cavidades e ligações finas.</li>
-            <li><strong>16+ vistas:</strong>&nbsp;útil para objetos complexos, assimétricos ou com detalhes pequenos.</li>
+            <li><strong>1–4 vistas:</strong>&nbsp;IA Multivista, com inferência explícita das superfícies ocultas.</li>
+            <li><strong>5–15 vistas:</strong>&nbsp;reconstrução híbrida com melhor cobertura de cavidades e ligações.</li>
+            <li><strong>20+ vistas:</strong>&nbsp;digitalização precisa com tentativa de alinhamento COLMAP/OpenMVS.</li>
             <li>Imagens repetidas não acrescentam cobertura; procura sempre um ângulo realmente novo.</li>
           </ul>
         </article>

@@ -1,6 +1,6 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-sqlalchemy==2.0.36
+sqlalchemy==2.0.51
 pydantic-settings==2.7.0
 python-multipart==0.0.20
 Pillow==12.3.0
@@ -8,7 +8,7 @@ numpy==2.4.6
 scipy==1.18.0
 pytest==8.3.4
 httpx==0.28.1
-psycopg[binary]==3.2.3
+psycopg[binary]==3.3.4
 trimesh==4.6.1
 rembg[cpu]==2.0.76
 alembic==1.16.5

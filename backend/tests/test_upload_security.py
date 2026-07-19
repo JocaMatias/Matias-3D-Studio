@@ -17,7 +17,7 @@ def jpeg_bytes(color: str = "teal") -> bytes:
 
 
 def create_project() -> str:
-    response = client.post("/api/projects", json={"name": "Upload seguro", "project_type": "ai_references"})
+    response = client.post("/api/projects", json={"name": "Upload seguro", "project_type": "ai_multiview"})
     assert response.status_code == 201
     return response.json()["id"]
 

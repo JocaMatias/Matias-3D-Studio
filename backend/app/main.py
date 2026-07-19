@@ -11,14 +11,25 @@ from .database import SessionLocal, get_db, migrate_database
 from .models import Artifact, Project, ProjectImage, ReconstructionJob, ReconstructionStage, ReconstructionVersion
 from .schemas import ProjectCreate, ProjectPatch, ProjectOut, ImageOut, JobOut, ArtifactOut, VersionOut
 from .validation import photogrammetry_trackability, validate_project
-from .reconstruction import STAGES, _render_model_preview, queue_job, reconstruction_engine_status
-from .strategy import MINIMUM_AI_IMAGES, RECOMMENDED_AI_IMAGES, capture_metrics, next_capture_suggestion, strategy_for_project
+from .reconstruction import PIPELINE_VERSION, STAGES, _render_model_preview, queue_job, reconstruction_engine_status
+from .strategy import (
+    capture_metrics,
+    minimum_images_for_mode,
+    next_capture_suggestion,
+    normalize_generation_mode,
+    recommended_images_for_mode,
+    strategy_for_project,
+)
 from .uploads import cleanup_orphaned_temporary_uploads, prepare_image_upload, remove_prepared_upload
 from .diagnostics import system_diagnostics
 
 
-def backfill_legacy_versions() -> None:
-    """Attach pre-versioning jobs and artifacts to immutable version records."""
+API_VERSION = "0.3.0"
+GENERATION_MODE_KEYS = ["ai_multiview", "hybrid", "precision_scan"]
+
+
+def backfill_legacy_versions(*, render_previews: bool = False) -> None:
+    """Attach legacy records without delaying API startup on heavy GLB renders."""
     with SessionLocal() as db:
         projects = db.scalars(select(Project)).all()
         changed = False
@@ -68,6 +79,9 @@ def backfill_legacy_versions() -> None:
                     project.status = "completed"
                     project.quality_score = (primary.metrics or {}).get("quality_score", project.quality_score)
                     changed = True
+
+            if not render_previews:
+                continue
 
             glb_artifacts = db.scalars(select(Artifact).where(
                 Artifact.project_id == project.id,
@@ -133,7 +147,7 @@ async def lifespan(_: FastAPI):
             db.commit()
     yield
 
-app = FastAPI(title="Matias 3D Studio API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Matias 3D Studio API", version=API_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
@@ -153,7 +167,13 @@ def project_or_404(db: Session, project_id: str) -> Project:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "queue_mode": settings.queue_mode, "reconstruction": reconstruction_engine_status()}
+    return {
+        "status": "ok",
+        "api_version": API_VERSION,
+        "generation_modes": GENERATION_MODE_KEYS,
+        "queue_mode": settings.queue_mode,
+        "reconstruction": reconstruction_engine_status(),
+    }
 
 
 @app.get("/api/system/diagnostics")
@@ -168,7 +188,9 @@ def reconstruction_engine():
 
 @app.post("/api/projects", response_model=ProjectOut, status_code=201)
 def create_project(body: ProjectCreate, db: Session = Depends(get_db)):
-    project = Project(**body.model_dump())
+    values = body.model_dump()
+    values["project_type"] = normalize_generation_mode(values["project_type"])
+    project = Project(**values)
     db.add(project); db.commit(); db.refresh(project)
     return project
 
@@ -207,7 +229,8 @@ def project_preview(project_id: str, db: Session = Depends(get_db)):
 @app.patch("/api/projects/{project_id}", response_model=ProjectOut)
 def patch_project(project_id: str, body: ProjectPatch, db: Session = Depends(get_db)):
     project = project_or_404(db, project_id)
-    for key, value in body.model_dump(exclude_none=True).items(): setattr(project, key, value)
+    for key, value in body.model_dump(exclude_none=True).items():
+        setattr(project, key, normalize_generation_mode(value) if key == "project_type" else value)
     db.commit(); return project
 
 
@@ -309,14 +332,17 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
     usable = approved + warnings
     trackability = photogrammetry_trackability(items)
     messages = []
-    if usable < MINIMUM_AI_IMAGES:
-        messages.append(f"Faltam {MINIMUM_AI_IMAGES - usable} fotografia(s) para ativar a reconstrução por IA.")
-    elif usable <= 10:
-        messages.append("A reconstrução por IA está disponível; mais ângulos aumentam a confiança geométrica.")
-    elif usable < 20:
-        messages.append("Boa cobertura para IA multivista; as vistas extra reforçam a seleção da melhor forma.")
-    if trackability["level"] == "low" and usable >= MINIMUM_AI_IMAGES:
-        messages.append("Objeto liso: adequado para IA multivista, mas pouco fiável para fotogrametria clássica.")
+    minimum_images = minimum_images_for_mode(project.project_type)
+    if usable < minimum_images:
+        messages.append(f"Faltam {minimum_images - usable} imagem(ns) para ativar o modo escolhido.")
+    elif normalize_generation_mode(project.project_type) == "ai_multiview":
+        messages.append("IA Multivista disponível; superfícies não observadas serão inferidas.")
+    elif normalize_generation_mode(project.project_type) == "hybrid":
+        messages.append("Reconstrução híbrida disponível; vistas adicionais reduzem zonas inferidas.")
+    else:
+        messages.append("Digitalização precisa disponível; todas as vistas serão usadas no alinhamento.")
+    if trackability["level"] == "low" and usable >= minimum_images:
+        messages.append("Objeto liso: a IA mantém um fallback caso a fotogrametria não alinhe câmaras suficientes.")
     if project.error_message and "multi-vista" in project.error_message:
         messages.append(project.error_message)
     consistency_values = [image.consistency_score for image in items if image.consistency_score is not None and image.validation_status != "rejected"]
@@ -331,9 +357,9 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
         "warnings": warnings,
         "rejected": rejected,
         "messages": messages,
-        "recommended_images": RECOMMENDED_AI_IMAGES,
-        "minimum_images": MINIMUM_AI_IMAGES,
-        "real_reconstruction_ready": usable >= MINIMUM_AI_IMAGES,
+        "recommended_images": recommended_images_for_mode(project.project_type),
+        "minimum_images": minimum_images_for_mode(project.project_type),
+        "real_reconstruction_ready": usable >= minimum_images_for_mode(project.project_type),
         "next_capture_suggestion": next_capture_suggestion(usable),
         "photogrammetry_trackability": trackability,
         **capture_metrics(usable, project.validation_score, trackability["level"], project.project_type),
@@ -353,10 +379,11 @@ def reconstruct(
     if not engine["available"]:
         raise HTTPException(503, engine["message"])
     usable_images = sum(image.validation_status != "rejected" for image in project.images)
-    if engine["real_reconstruction"] and usable_images < MINIMUM_AI_IMAGES:
+    minimum_images = minimum_images_for_mode(project.project_type)
+    if usable_images < minimum_images:
         raise HTTPException(
             409,
-            f"Há {usable_images} imagens utilizáveis. São necessárias pelo menos {MINIMUM_AI_IMAGES}.",
+            f"Há {usable_images} imagens utilizáveis. São necessárias pelo menos {minimum_images} para este modo.",
         )
     active = db.scalar(select(ReconstructionJob).where(ReconstructionJob.project_id == project.id, ReconstructionJob.status.in_(["queued", "processing"])))
     if active: raise HTTPException(409, "Já existe uma reconstrução ativa.")
@@ -372,7 +399,7 @@ def reconstruct(
     }[quality_profile]
     configuration = {
         "mode": settings.reconstruction_mode,
-        "pipeline_version": "adaptive-ai-v2",
+        "pipeline_version": PIPELINE_VERSION,
         "strategy": strategy.as_dict(),
         "photogrammetry_trackability": trackability,
         "project_type": project.project_type,
@@ -400,6 +427,14 @@ def reconstruct(
     project.status = "queued"; db.commit()
     job = db.scalar(select(ReconstructionJob).options(selectinload(ReconstructionJob.stages)).where(ReconstructionJob.id == job.id))
     queue_job(job.id)
+    if settings.queue_mode.lower() == "inline":
+        db.expire_all()
+        job = db.scalar(
+            select(ReconstructionJob)
+            .options(selectinload(ReconstructionJob.stages))
+            .where(ReconstructionJob.id == job.id)
+        )
+        job.stages.sort(key=lambda stage: stage.order)
     return job
 
 

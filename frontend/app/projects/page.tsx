@@ -52,9 +52,9 @@ export default function Projects() {
         </select>
         <select className="input" style={{ width: 180 }} value={type} onChange={(event) => setType(event.target.value)}>
           <option value="all">Todos os tipos</option>
-          <option value="real_photos">Fotos reais</option>
-          <option value="ai_references">Referências IA</option>
-          <option value="hybrid">Híbrido</option>
+          <option value="ai_multiview">IA Multivista</option>
+          <option value="hybrid">Reconstrução híbrida</option>
+          <option value="precision_scan">Digitalização precisa</option>
         </select>
       </div>
 

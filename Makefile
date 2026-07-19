@@ -1,6 +1,6 @@
 .PHONY: install dev test build docker
 install:
-	cd frontend && npm install
+	cd frontend && npm ci
 	python -m pip install -r backend/requirements.txt
 dev:
 	@echo "Executa em dois terminais: make backend e make frontend"
@@ -14,4 +14,3 @@ build:
 	cd frontend && npm run build
 docker:
 	docker compose up --build
-

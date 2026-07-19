@@ -10,7 +10,7 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     description: str = Field(default="", max_length=1000)
     capture_type: str = Field(default="small_object", pattern="^(small_object|medium_object|environment)$")
-    project_type: str = Field(default="real_photos", pattern="^(real_photos|ai_references|hybrid)$")
+    project_type: str = Field(default="ai_multiview", pattern="^(ai_multiview|hybrid|precision_scan)$")
     category: str = Field(default="generic", pattern="^(generic|product|character|vehicle|architecture|furniture|other)$")
 
 
@@ -18,7 +18,7 @@ class ProjectPatch(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=120)
     description: str | None = Field(default=None, max_length=1000)
     capture_type: str | None = Field(default=None, pattern="^(small_object|medium_object|environment)$")
-    project_type: str | None = Field(default=None, pattern="^(real_photos|ai_references|hybrid)$")
+    project_type: str | None = Field(default=None, pattern="^(ai_multiview|hybrid|precision_scan)$")
     category: str | None = Field(default=None, pattern="^(generic|product|character|vehicle|architecture|furniture|other)$")
 
 
@@ -71,6 +71,7 @@ class StageOut(ORMModel):
 class JobOut(ORMModel):
     id: str
     version_id: str | None
+    queue_id: str | None
     status: str
     current_stage: str
     progress: int

@@ -14,7 +14,7 @@ export default function Home() {
             width={500}
             height={500}
             alt=""
-            priority
+            priority  
           />
         </div>
         <h1 id="home-title">Matias <span>3D</span> Studio</h1>

@@ -22,9 +22,11 @@ class Settings(BaseSettings):
     hunyuan_root: Path = PROJECT_ROOT / "tools" / "Hunyuan3D-2"
     hunyuan_python: Path = PROJECT_ROOT / "tools" / "hunyuan-env" / "python.exe"
     hunyuan_model_cache: Path = PROJECT_ROOT / "tools" / "hunyuan-models"
-    # u2netp is fast enough for a laptop CPU and preserves small-object masks;
-    # the former 178 MB ISNet model could take several minutes per photograph.
-    segmentation_model: str = "u2netp"
+    # Shape generation is only as good as the alpha masks it receives.  IS-Net
+    # is materially better than the 4.6 MB u2netp model on pale, reflective and
+    # thin objects; on this workstation one session processes an orbit quickly
+    # enough that the quality gain is worth the small startup cost.
+    segmentation_model: str = "isnet-general-use"
     enable_object_segmentation: bool = True
     enable_ai_texturing: bool = True
     reconstruction_timeout_hours: float = 8
