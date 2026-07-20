@@ -45,11 +45,15 @@ export default function Result() {
   const failed = selectedVersion?.status === "failed" || (!selectedVersion && job?.status === "failed");
   const simulated = glb?.artifact_metadata.simulated === true;
   const displayable = Boolean(glb && !simulated && glb.artifact_metadata.displayable !== false);
-  const fidelity = Number(metrics.visual_fidelity ?? project?.quality_score ?? 0);
-  const confidence = Number(metrics.geometric_confidence ?? 0);
   const observedCoverage = Number(metrics.observed_coverage ?? 0);
   const resultTier = String(metrics.result_tier ?? glb?.artifact_metadata.result_tier ?? "");
   const recoveryMode = String(metrics.recovery_mode ?? glb?.artifact_metadata.recovery_mode ?? "none");
+  const hasTexture = metrics.has_texture === true || glb?.artifact_metadata.has_texture === true;
+  const hasVertexColors = metrics.has_vertex_colors === true || glb?.artifact_metadata.has_vertex_colors === true;
+  const geometryQuality = Number(metrics.geometry_quality_score ?? metrics.geometric_confidence ?? 0);
+  const visualMatch = Number(metrics.visual_match_score ?? metrics.visual_fidelity ?? 0);
+  const textureQuality = Number(metrics.texture_quality_score ?? 0);
+  const qualityStatus = String(metrics.quality_status ?? "");
   const recoveryWarnings = Array.isArray(metrics.recovery_warnings)
     ? metrics.recovery_warnings.map(String).filter(Boolean)
     : [];
@@ -120,13 +124,13 @@ export default function Result() {
 
       {failed ? <section className="card mock-blocker"><AlertTriangle size={42} color="var(--warning)" /><div><div className="eyebrow" style={{ color: "var(--warning)" }}>Reconstrução incompleta</div><h2>Esta versão não gerou geometria fiável.</h2><p className="sub">{selectedVersion?.warnings?.[0] || job?.error_message}</p><p className="sub">As versões anteriores permanecem intactas. Adiciona vistas das zonas frágeis e cria uma nova versão.</p><Link className="btn primary" href={`/projects/${id}/capture`}><RotateCcw size={17} /> Melhorar referências</Link></div></section>
       : simulated ? <section className="card mock-blocker"><AlertTriangle size={42} color="var(--warning)" /><div><div className="eyebrow" style={{ color: "var(--warning)" }}>Demonstração técnica</div><h2>Este ficheiro é apenas uma geometria de teste.</h2><p className="sub">Não é apresentado como uma reconstrução real. Volta à captura e utiliza um motor disponível.</p><Link className="btn primary" href={`/projects/${id}/capture`}><RotateCcw size={17} /> Reconstruir em modo real</Link></div></section>
-      : displayable && glb ? <Viewer url={`${API}/api/projects/${id}/download/${glb.id}?inline=true`} />
+      : displayable && glb ? <Viewer url={`${API}/api/projects/${id}/download/${glb.id}?inline=true`} hasTexture={hasTexture} hasVertexColors={hasVertexColors} />
       : <div className="card empty">A carregar e verificar o modelo desta versão…</div>}
 
       {!simulated && !failed && <div className="grid3" style={{ marginTop: 16 }}>
-        <div className="card"><div className="eyebrow">Fidelidade visual</div><h2>{fidelity || "—"}%</h2><p className="sub">Semelhança estimada com as referências usadas nesta versão.</p></div>
-        <div className="card"><div className="eyebrow">Confiança geométrica</div><h2>{confidence || "—"}%</h2><p className="sub">Cobertura observada e consistência da forma reconstruída.</p></div>
-        <div className="card"><div className="eyebrow">Modelo otimizado</div><h2>{String(metrics.triangles ?? "—")} triângulos</h2><p className="sub">{String(metrics.input_images ?? metrics.cameras ?? selectedVersion?.metrics.input_images ?? "—")} imagens · {glb ? (glb.file_size / 1024 / 1024).toFixed(1) : "—"} MB{reduction ? ` · ${reduction}% mais leve` : ""}</p><p className="sub">{String(metrics.texture_mode ?? "Material PBR")}</p></div>
+        <div className="card"><div className="eyebrow">Correspondência visual final</div><h2>{visualMatch || "—"}%</h2><p className="sub">Comparação entre a silhueta do modelo e a imagem principal.</p></div>
+        <div className="card"><div className="eyebrow">Qualidade geométrica final</div><h2>{geometryQuality || "—"}%</h2><p className="sub">Integridade da malha, fragmentação e componente principal.</p></div>
+        <div className="card"><div className="eyebrow">Textura e material</div><h2>{textureQuality ? `${textureQuality}%` : "—"}</h2><p className="sub">{String(metrics.texture_mode ?? "Sem informação")}</p><p className="sub">Estado: {qualityStatus || "não medido"}</p></div>
       </div>}
     </main>
   );

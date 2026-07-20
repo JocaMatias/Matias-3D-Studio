@@ -10,16 +10,18 @@ class ProjectCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
     description: str = Field(default="", max_length=1000)
     capture_type: str = Field(default="small_object", pattern="^(small_object|medium_object|environment)$")
-    project_type: str = Field(default="ai_multiview", pattern="^(ai_multiview|hybrid|precision_scan)$")
+    project_type: str = Field(default="ai_generation", pattern="^(ai_generation|reality_scan|ai_multiview|hybrid|precision_scan)$")
     category: str = Field(default="generic", pattern="^(generic|product|character|vehicle|architecture|furniture|other)$")
+    object_profile: str = Field(default="auto", pattern="^(auto|compact|thin_parts|multi_component|handled_container|mechanical|organic|architecture)$")
 
 
 class ProjectPatch(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=120)
     description: str | None = Field(default=None, max_length=1000)
     capture_type: str | None = Field(default=None, pattern="^(small_object|medium_object|environment)$")
-    project_type: str | None = Field(default=None, pattern="^(ai_multiview|hybrid|precision_scan)$")
+    project_type: str | None = Field(default=None, pattern="^(ai_generation|reality_scan|ai_multiview|hybrid|precision_scan)$")
     category: str | None = Field(default=None, pattern="^(generic|product|character|vehicle|architecture|furniture|other)$")
+    object_profile: str | None = Field(default=None, pattern="^(auto|compact|thin_parts|multi_component|handled_container|mechanical|organic|architecture)$")
 
 
 class ProjectOut(ORMModel):
@@ -29,6 +31,7 @@ class ProjectOut(ORMModel):
     capture_type: str
     project_type: str
     category: str
+    object_profile: str
     status: str
     created_at: datetime
     updated_at: datetime

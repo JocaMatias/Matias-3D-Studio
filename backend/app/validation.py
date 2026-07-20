@@ -7,8 +7,6 @@ from sqlalchemy.orm import Session
 from .config import PROJECT_ROOT
 from .models import Project
 from .strategy import (
-    HYBRID_RECOMMENDED_MAX_IMAGES,
-    PRECISION_MIN_IMAGES,
     capture_metrics,
     minimum_images_for_mode,
     next_capture_suggestion,
@@ -165,7 +163,7 @@ def validate_project(db: Session, project: Project) -> dict:
             consistency = int(np.clip(round(float(np.dot(primary, signature)) * 100), 0, 100))
             item.consistency_score = consistency
             scores.append(consistency)
-            if mode in {"ai_multiview", "hybrid"} and consistency < 38 and item.validation_status == "approved":
+            if mode == "reality_scan" and consistency < 38 and item.validation_status == "approved":
                 item.validation_status = "warning"
                 item.validation_messages = [
                     *item.validation_messages,
@@ -177,7 +175,7 @@ def validate_project(db: Session, project: Project) -> dict:
 
     count = len(project.images)
     usable = approved + warnings
-    quantity_target = {"ai_multiview": 4, "hybrid": 10, "precision_scan": 24}[mode]
+    quantity_target = 1 if mode == "ai_generation" else 24
     quantity_score = min(100, round(usable / quantity_target * 100))
     technical_score = round((approved + warnings * 0.72) / max(1, count) * 100)
     capture_penalty = min(20, round(flash_count / max(1, count) * 16))
@@ -192,17 +190,13 @@ def validate_project(db: Session, project: Project) -> dict:
         global_warnings.append(
             f"São necessárias pelo menos {minimum_images} imagens utilizáveis para o modo escolhido."
         )
-    elif mode == "ai_multiview":
+    elif mode == "ai_generation":
         global_warnings.append(
-            "A IA vai inferir superfícies não observadas; cada ângulo complementar reduz a parte inventada."
+            "A IA local usa apenas a imagem principal; as zonas invisíveis serão estimadas."
         )
-    elif mode == "hybrid" and usable > HYBRID_RECOMMENDED_MAX_IMAGES:
+    elif mode == "reality_scan" and trackability["level"] != "high":
         global_warnings.append(
-            f"Tens {usable} vistas. Com {PRECISION_MIN_IMAGES} ou mais podes usar Digitalização precisa."
-        )
-    elif mode == "precision_scan" and trackability["level"] != "high":
-        global_warnings.append(
-            "A digitalização será tentada, mas superfícies pouco texturadas podem obrigar ao fallback generativo."
+            "A digitalização real pode falhar em superfícies lisas, transparentes ou refletoras."
         )
     if trackability["level"] == "low":
         global_warnings.append("Objeto liso detetado: a fotogrametria pode ter poucas correspondências visuais.")
@@ -210,7 +204,7 @@ def validate_project(db: Session, project: Project) -> dict:
         global_warnings.append(f"Flash/reflexos fortes detetados em {flash_count} imagem(ns).")
     if background_dominant_count > count * 0.35:
         global_warnings.append("O fundo tem mais detalhe do que o objeto; a segmentação automática irá isolá-lo.")
-    if mode in {"ai_multiview", "hybrid"} and consistency_estimate < 58:
+    if mode == "reality_scan" and consistency_estimate < 58:
         global_warnings.append(
             "As referências têm baixa consistência visual. Confirma que representam o mesmo objeto e define a vista principal."
         )
@@ -241,7 +235,7 @@ def validate_project(db: Session, project: Project) -> dict:
         "recommended_images": recommended_images,
         "minimum_images": minimum_images,
         "real_reconstruction_ready": usable >= minimum_images,
-        "next_capture_suggestion": next_capture_suggestion(usable),
+        "next_capture_suggestion": next_capture_suggestion(usable, mode),
         "photogrammetry_trackability": trackability,
         **capture_metrics(usable, score, trackability["level"], mode),
     }

@@ -24,8 +24,8 @@ from .uploads import cleanup_orphaned_temporary_uploads, prepare_image_upload, r
 from .diagnostics import system_diagnostics
 
 
-API_VERSION = "0.3.0"
-GENERATION_MODE_KEYS = ["ai_multiview", "hybrid", "precision_scan"]
+API_VERSION = "0.4.0"
+GENERATION_MODE_KEYS = ["ai_generation", "reality_scan"]
 
 
 def backfill_legacy_versions(*, render_previews: bool = False) -> None:
@@ -335,12 +335,10 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
     minimum_images = minimum_images_for_mode(project.project_type)
     if usable < minimum_images:
         messages.append(f"Faltam {minimum_images - usable} imagem(ns) para ativar o modo escolhido.")
-    elif normalize_generation_mode(project.project_type) == "ai_multiview":
-        messages.append("IA Multivista disponível; superfícies não observadas serão inferidas.")
-    elif normalize_generation_mode(project.project_type) == "hybrid":
-        messages.append("Reconstrução híbrida disponível; vistas adicionais reduzem zonas inferidas.")
+    elif normalize_generation_mode(project.project_type) == "ai_generation":
+        messages.append("Criação local com IA disponível; apenas a imagem principal define esta geração.")
     else:
-        messages.append("Digitalização precisa disponível; todas as vistas serão usadas no alinhamento.")
+        messages.append("Digitalização real disponível; todas as fotografias aprovadas serão usadas no alinhamento.")
     if trackability["level"] == "low" and usable >= minimum_images:
         messages.append("Objeto liso: a IA mantém um fallback caso a fotogrametria não alinhe câmaras suficientes.")
     if project.error_message and "multi-vista" in project.error_message:
@@ -360,7 +358,7 @@ def validation_report(project_id: str, db: Session = Depends(get_db)):
         "recommended_images": recommended_images_for_mode(project.project_type),
         "minimum_images": minimum_images_for_mode(project.project_type),
         "real_reconstruction_ready": usable >= minimum_images_for_mode(project.project_type),
-        "next_capture_suggestion": next_capture_suggestion(usable),
+        "next_capture_suggestion": next_capture_suggestion(usable, project.project_type),
         "photogrammetry_trackability": trackability,
         **capture_metrics(usable, project.validation_score, trackability["level"], project.project_type),
         "images": [ImageOut.model_validate(item) for item in items],
@@ -376,8 +374,12 @@ def reconstruct(
     project = project_or_404(db, project_id)
     if project.image_count < 1 or project.validation_score is None: raise HTTPException(409, "Valida as imagens antes de iniciar.")
     engine = reconstruction_engine_status()
-    if not engine["available"]:
-        raise HTTPException(503, engine["message"])
+    public_mode = normalize_generation_mode(project.project_type)
+    if public_mode == "ai_generation":
+        if not engine.get("local_ai", {}).get("available") and settings.reconstruction_mode.lower() != "mock":
+            raise HTTPException(503, engine.get("local_ai", {}).get("message") or engine["message"])
+    elif not engine.get("photogrammetry", {}).get("available") and settings.reconstruction_mode.lower() != "mock":
+        raise HTTPException(503, "A digitalização real ainda não está instalada. Configura COLMAP e OpenMVS.")
     usable_images = sum(image.validation_status != "rejected" for image in project.images)
     minimum_images = minimum_images_for_mode(project.project_type)
     if usable_images < minimum_images:
@@ -389,21 +391,23 @@ def reconstruct(
     if active: raise HTTPException(409, "Já existe uma reconstrução ativa.")
     trackability = photogrammetry_trackability(project.images)
     strategy = strategy_for_project(project.project_type, usable_images, trackability["level"])
-    image_ids = [image.id for image in project.images if image.validation_status != "rejected"]
-    primary_image = next((image for image in project.images if image.is_primary), None)
+    primary_image = next((image for image in project.images if image.is_primary and image.validation_status != "rejected"), None)
+    usable_image_ids = [image.id for image in project.images if image.validation_status != "rejected"]
+    image_ids = [primary_image.id] if public_mode == "ai_generation" and primary_image else usable_image_ids
     version_number = (db.scalar(select(func.max(ReconstructionVersion.number)).where(ReconstructionVersion.project_id == project.id)) or 0) + 1
     profile_settings = {
-        "preview": {"target_faces": 25000, "label": "Pré-visualização rápida"},
-        "standard": {"target_faces": 60000, "label": "Equilibrado"},
-        "high": {"target_faces": 120000, "label": "Alta qualidade"},
+        "preview": {"candidate_count": 1, "texture_resolution": 512, "label": "Rápido"},
+        "standard": {"candidate_count": 2, "texture_resolution": 1024, "label": "Equilibrado"},
+        "high": {"candidate_count": 3, "texture_resolution": 2048, "label": "Alta qualidade"},
     }[quality_profile]
     configuration = {
         "mode": settings.reconstruction_mode,
         "pipeline_version": PIPELINE_VERSION,
         "strategy": strategy.as_dict(),
         "photogrammetry_trackability": trackability,
-        "project_type": project.project_type,
+        "project_type": public_mode,
         "category": project.category,
+        "object_profile": project.object_profile,
         "quality_profile": quality_profile,
         **profile_settings,
     }

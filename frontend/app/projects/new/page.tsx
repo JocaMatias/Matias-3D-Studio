@@ -2,18 +2,23 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Layers3, ScanLine, Sparkles } from "lucide-react";
+import { ArrowRight, Lock, ScanLine, Sparkles } from "lucide-react";
 import { Project, ProjectType, request } from "@/lib/api";
 
-const choices: { value: ProjectType; title: string; description: string; icon: typeof Sparkles }[] = [
-  { value: "ai_multiview", title: "IA Multivista", description: "1–4 imagens. Gera as zonas ocultas e compara vários candidatos.", icon: Sparkles },
-  { value: "hybrid", title: "Reconstrução híbrida", description: "5–15 imagens. Combina observação real com preenchimento assistido por IA.", icon: Layers3 },
-  { value: "precision_scan", title: "Digitalização precisa", description: "20+ imagens. Recupera câmaras, geometria densa e textura projetada.", icon: ScanLine },
-];
+const profiles = [
+  ["auto", "Automático"],
+  ["compact", "Objeto compacto"],
+  ["thin_parts", "Partes finas"],
+  ["multi_component", "Várias peças"],
+  ["handled_container", "Recipiente com pega"],
+  ["mechanical", "Mecânico"],
+  ["organic", "Orgânico"],
+  ["architecture", "Arquitetura"],
+] as const;
 
 export default function NewProject() {
   const router = useRouter();
-  const [projectType, setProjectType] = useState<ProjectType>("ai_multiview");
+  const [projectType, setProjectType] = useState<ProjectType>("ai_generation");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -37,9 +42,26 @@ export default function NewProject() {
   return (
     <main className="shell">
       <form className="card form" onSubmit={submit}>
-        <h1>O que vamos modelar?</h1>
-        <p className="sub">Escolhe o nível de cobertura disponível; cada modo tem validação e motor próprios.</p>
+        <h1>Como queres criar o modelo?</h1>
+        <p className="sub">A versão atual cria localmente a partir de uma imagem. A digitalização real será adicionada numa fase própria.</p>
         {error && <p className="error">{error}</p>}
+
+        <div className="field">
+          <label>Modo</label>
+          <div className="choice-grid">
+            <button className={`choice ${projectType === "ai_generation" ? "active" : ""}`} type="button" onClick={() => setProjectType("ai_generation")}>
+              <Sparkles size={22} color="var(--mint)" />
+              <strong style={{ display: "block", margin: "10px 0 5px", color: "var(--text)" }}>Criar com IA</strong>
+              <span className="sub" style={{ fontSize: 12 }}>Uma imagem principal. O motor local estima as zonas invisíveis, cria textura e exporta GLB.</span>
+            </button>
+            <button className="choice" type="button" disabled title="Em desenvolvimento">
+              <ScanLine size={22} color="var(--muted)" />
+              <strong style={{ display: "block", margin: "10px 0 5px", color: "var(--text)" }}>Digitalizar objeto real</strong>
+              <span className="sub" style={{ fontSize: 12 }}>Muitas fotografias reais, geometria baseada em observação e textura fotográfica.</span>
+              <span className="badge" style={{ marginTop: 10 }}><Lock size={12} /> Em desenvolvimento</span>
+            </button>
+          </div>
+        </div>
 
         <div className="field">
           <label>Nome do projeto</label>
@@ -47,22 +69,14 @@ export default function NewProject() {
         </div>
         <div className="field">
           <label>Descrição opcional</label>
-          <textarea className="input" name="description" rows={3} placeholder="Material, escala, detalhes importantes ou objetivo do modelo" />
+          <textarea className="input" name="description" rows={3} placeholder="Material, detalhes importantes ou objetivo do modelo" />
         </div>
         <div className="field">
-          <label>Modo de geração</label>
-          <div className="choice-grid">
-            {choices.map((choice) => {
-              const Icon = choice.icon;
-              return (
-                <button className={`choice ${projectType === choice.value ? "active" : ""}`} type="button" key={choice.value} onClick={() => setProjectType(choice.value)}>
-                  <Icon size={22} color="var(--mint)" />
-                  <strong style={{ display: "block", margin: "10px 0 5px", color: "var(--text)" }}>{choice.title}</strong>
-                  <span className="sub" style={{ fontSize: 12 }}>{choice.description}</span>
-                </button>
-              );
-            })}
-          </div>
+          <label>Perfil do objeto</label>
+          <select className="input" name="object_profile" defaultValue="auto">
+            {profiles.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
+          </select>
+          <span className="sub">Ajuda a preservar peças pequenas, cavidades, superfícies planas e partes finas durante a avaliação.</span>
         </div>
         <div className="field">
           <label>Categoria</label>
@@ -76,15 +90,8 @@ export default function NewProject() {
             <option value="other">Outro</option>
           </select>
         </div>
-        <div className="field">
-          <label>Escala da captura</label>
-          <select className="input" name="capture_type" defaultValue="small_object">
-            <option value="small_object">Objeto pequeno</option>
-            <option value="medium_object">Objeto médio</option>
-            <option value="environment">Espaço ou ambiente</option>
-          </select>
-        </div>
-        <button className="btn primary" disabled={busy}>{busy ? "A criar…" : "Criar e adicionar imagens"}<ArrowRight size={17} /></button>
+        <input type="hidden" name="capture_type" value="small_object" />
+        <button className="btn primary" disabled={busy}>{busy ? "A criar…" : "Criar e escolher imagem"}<ArrowRight size={17} /></button>
       </form>
     </main>
   );

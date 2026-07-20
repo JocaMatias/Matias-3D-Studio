@@ -17,7 +17,14 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from .config import PROJECT_ROOT, settings
 from .database import SessionLocal
 from .models import Artifact, Project, ReconstructionJob, ReconstructionVersion
-from .strategy import MINIMUM_AI_IMAGES, capture_metrics, strategy_for_project
+from .strategy import MINIMUM_AI_IMAGES, capture_metrics, normalize_generation_mode, strategy_for_project
+from .local_ai import (
+    discover_local_ai_engines,
+    local_ai_engine_status,
+    prepare_transparent_input,
+    run_local_ai_candidate,
+    select_best_candidate,
+)
 from .validation import photogrammetry_trackability
 
 STAGES = [
@@ -30,7 +37,7 @@ STAGES = [
     "Exportar GLB",
 ]
 
-PIPELINE_VERSION = "quality-first-v8"
+PIPELINE_VERSION = "local-single-image-ai-v1"
 MASK_PIPELINE_VERSION = "isnet-quality-v2"
 
 _LOCAL_JOB_QUEUE: queue.Queue[str] = queue.Queue()
@@ -167,61 +174,49 @@ def _hunyuan_texture_runtime(python: Path) -> Path | None:
 
 def reconstruction_engine_status() -> dict:
     mode = settings.reconstruction_mode.lower()
+    local_ai = local_ai_engine_status()
     if mode == "mock":
         return {
             "mode": mode,
             "available": True,
             "real_reconstruction": False,
-            "message": "Modo de demonstração; não reconstrói a geometria das fotografias.",
+            "pipeline_version": PIPELINE_VERSION,
+            "generation_modes": ["ai_generation", "reality_scan"],
+            "local_ai": local_ai,
+            "message": "Modo de demonstração; não reconstrói geometria real.",
         }
-    if mode == "meshroom":
-        executable = _find_meshroom_executable()
-        pipeline = _find_meshroom_pipeline()
-        available = executable is not None and pipeline is not None
-        return {
-            "mode": mode,
-            "available": available,
-            "real_reconstruction": True,
-            "executable": str(executable) if executable else None,
-            "pipeline": str(pipeline) if pipeline else None,
-            "message": "Meshroom pronto." if available else "Meshroom ainda não está instalado ou não foi encontrado.",
-        }
-    executable = _find_colmap_executable()
+
+    colmap = _find_colmap_executable()
     required_openmvs = [
         _find_openmvs_executable("InterfaceCOLMAP"),
         _find_openmvs_executable("DensifyPointCloud"),
         _find_openmvs_executable("ReconstructMesh"),
         _find_openmvs_executable("TextureMesh"),
     ]
-    photogrammetry_available = executable is not None and all(required_openmvs)
-    hunyuan_python, hunyuan_generator = _find_hunyuan_runtime()
-    generative_available = hunyuan_python is not None and hunyuan_generator is not None
-    paint_model_available = _find_hunyuan_texture_model() is not None
-    paint_runtime_available = bool(hunyuan_python and _hunyuan_texture_runtime(hunyuan_python))
-    available = photogrammetry_available or generative_available
-    if photogrammetry_available and generative_available:
-        message = "IA multivista e fotogrametria prontas para os três modos de geração."
-    elif generative_available:
-        message = "IA Multivista pronta; a Reconstrução híbrida usa validação reforçada."
+    photogrammetry_available = colmap is not None and all(required_openmvs)
+    available = bool(local_ai["available"] or photogrammetry_available)
+    if local_ai["available"]:
+        message = local_ai["message"]
+    elif photogrammetry_available:
+        message = "Digitalização real pronta; instala o motor local de IA para criar a partir de uma imagem."
     else:
-        message = "Os motores de reconstrução não foram encontrados."
+        message = "Nenhum motor está pronto. Executa desktop/install-local-ai-engines.ps1 para instalar a IA local."
     return {
         "mode": mode,
         "pipeline_version": PIPELINE_VERSION,
         "available": available,
         "real_reconstruction": True,
-        "executable": str(executable) if executable else None,
-        "pipeline": "Hunyuan3D multi-candidato + PBR · COLMAP adaptativo",
-        "generative_ai": generative_available,
-        "photogrammetry": photogrammetry_available,
-        "minimum_images": MINIMUM_AI_IMAGES,
-        "recommended_images": "1–4 / 5–15 / 20+",
-        "texture_model": paint_model_available,
-        "native_texture_runtime": paint_runtime_available,
-        "texture_fallback": "multiview_uv_texture",
+        "generation_modes": ["ai_generation", "reality_scan"],
+        "pipeline": "SPAR3D Low VRAM → Stable Fast 3D fallback · COLMAP/OpenMVS",
+        "local_ai": local_ai,
+        "photogrammetry": {
+            "available": photogrammetry_available,
+            "colmap": str(colmap) if colmap else None,
+        },
+        "minimum_images": 1,
+        "recommended_images": "1 imagem principal",
         "message": message,
     }
-
 
 def create_mock_glb(path: Path) -> None:
     """Create a tiny valid GLB used only by automated development tests."""
@@ -344,41 +339,26 @@ def run_job(job_id: str) -> None:
         project.error_message = None
         db.commit()
         mode = settings.reconstruction_mode.lower()
-        if mode == "meshroom":
-            _run_meshroom(db, job, project)
-        elif mode == "colmap":
-            usable = sum(image.validation_status != "rejected" for image in project.images)
-            trackability = photogrammetry_trackability(project.images)
-            strategy = strategy_for_project(project.project_type, usable, trackability["level"])
-            job.configuration = {
-                **(job.configuration or {}),
-                "pipeline_version": PIPELINE_VERSION,
-                "photogrammetry_trackability": trackability,
-                "strategy": strategy.as_dict(),
-            }
-            db.commit()
-            hunyuan_python, _ = _find_hunyuan_runtime()
-            if strategy.uses_photogrammetry and _find_colmap_executable():
-                try:
-                    _run_colmap(db, job, project)
-                except JobCancelled:
-                    # Cancellation is a terminal user action, not a reason to
-                    # silently start a second, GPU-heavy fallback process.
-                    raise
-                except Exception as photogrammetry_error:
-                    if not hunyuan_python:
-                        raise
-                    _reset_job_for_fallback(db, job)
-                    job.configuration = {
-                        **(job.configuration or {}),
-                        "photogrammetry_fallback_reason": str(photogrammetry_error),
-                    }
-                    db.commit()
-                    _run_hunyuan(db, job, project, strategy_key=f"{strategy.key}_fallback")
-            else:
-                _run_hunyuan(db, job, project, strategy_key=strategy.key)
-        else:
+        public_mode = normalize_generation_mode(project.project_type)
+        usable = sum(image.validation_status != "rejected" for image in project.images)
+        trackability = photogrammetry_trackability(project.images)
+        strategy = strategy_for_project(public_mode, usable, trackability["level"])
+        job.configuration = {
+            **(job.configuration or {}),
+            "pipeline_version": PIPELINE_VERSION,
+            "photogrammetry_trackability": trackability,
+            "strategy": strategy.as_dict(),
+            "project_type": public_mode,
+        }
+        db.commit()
+        if mode == "mock":
             _run_mock(db, job, project)
+        elif public_mode == "ai_generation":
+            _run_local_ai(db, job, project)
+        elif mode == "meshroom":
+            _run_meshroom(db, job, project)
+        else:
+            _run_colmap(db, job, project)
     except JobCancelled as exc:
         job.status = "cancelled"
         job.error_message = str(exc)
@@ -438,6 +418,12 @@ def _advance(db, job, stage, percent: int, message: str):
     else:
         stage.completed_at = None
     db.commit()
+
+
+def _check_job_cancelled(db, job) -> None:
+    db.refresh(job)
+    if job.status == "cancelled":
+        raise JobCancelled("Reconstrução cancelada pelo utilizador.")
 
 
 def _finish(db, job, project, output: Path, metrics: dict, metadata: dict):
@@ -1478,6 +1464,239 @@ def _read_hunyuan_result(log_path: Path) -> dict:
             except json.JSONDecodeError:
                 return {}
     return {}
+
+
+def _run_local_ai(db, job, project):
+    engines = [engine for engine in discover_local_ai_engines() if engine.available]
+    if not engines:
+        raise RuntimeError(
+            "Nenhum motor local de IA está instalado. Executa desktop/install-local-ai-engines.ps1."
+        )
+
+    workspace = settings.storage_root / project.id / "reconstruction" / job.id
+    images_dir = workspace / "images"
+    masks_dir = workspace / "masks"
+    candidates_dir = workspace / "candidates"
+    artifacts_dir = settings.storage_root / project.id / "artifacts"
+    cache_dir = _resolved_tool_root(settings.local_ai_model_cache)
+    for directory in (workspace, images_dir, masks_dir, candidates_dir, artifacts_dir, cache_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    stages = sorted(job.stages, key=lambda value: value.order)
+    log_path = workspace / "local-ai.log"
+    job.logs_path = str(log_path)
+
+    _advance(db, job, stages[0], 15, "A preparar a imagem principal e o recorte transparente…")
+    image_count = _prepare_images(project, images_dir)
+    if image_count < 1:
+        raise RuntimeError("Carrega e valida uma imagem principal antes de gerar.")
+    mask_count = _prepare_object_masks(images_dir, masks_dir)
+    primary = images_dir / "image-0000.jpg"
+    primary_mask = masks_dir / "image-0000.mask.png"
+    if not primary.is_file() or not primary_mask.is_file():
+        raise RuntimeError("Não foi possível preparar a imagem principal para a IA local.")
+    prepared_input = prepare_transparent_input(primary, primary_mask, workspace / "primary-input.png")
+    _advance(db, job, stages[0], 100, f"Imagem principal preparada · {mask_count} máscara(s) verificadas")
+
+    quality_profile = str((job.configuration or {}).get("quality_profile", "standard"))
+    profile = {
+        "preview": {"candidates": 1, "texture": 512, "label": "Rápido"},
+        "standard": {"candidates": 2, "texture": 1024, "label": "Equilibrado"},
+        "high": {"candidates": 3, "texture": 2048, "label": "Alta qualidade"},
+    }.get(quality_profile, {"candidates": 2, "texture": 1024, "label": "Equilibrado"})
+    seeds = [1729, 4099, 7919]
+    generated: list[dict] = []
+    failures: list[str] = []
+
+    _advance(db, job, stages[1], 100, "A imagem principal é a âncora de identidade desta versão")
+    _advance(db, job, stages[2], 100, "As zonas invisíveis serão estimadas pelo motor local")
+    _advance(db, job, stages[3], 100, "A preparar candidatos sequenciais para uma GPU de 8 GB")
+
+    primary_engine = engines[0]
+    for index in range(int(profile["candidates"])):
+        candidate_path = candidates_dir / f"{primary_engine.key}-{index + 1}.glb"
+        _advance(
+            db,
+            job,
+            stages[4],
+            min(90, 8 + round(index / max(1, int(profile["candidates"])) * 80)),
+            f"{primary_engine.label}: candidato {index + 1}/{profile['candidates']}…",
+        )
+        try:
+            runtime = run_local_ai_candidate(
+                primary_engine,
+                input_path=prepared_input,
+                output_path=candidate_path,
+                cache_dir=cache_dir,
+                seed=seeds[index],
+                texture_resolution=int(profile["texture"]),
+                timeout_seconds=settings.reconstruction_timeout_hours * 3600,
+                log_path=log_path,
+                cancel_check=lambda: _check_job_cancelled(db, job),
+            )
+            generated.append({**runtime, "path": str(candidate_path)})
+        except JobCancelled:
+            raise
+        except Exception as error:
+            failures.append(str(error))
+
+    if not generated and len(engines) > 1:
+        fallback = engines[1]
+        _advance(db, job, stages[4], 72, f"{primary_engine.label} falhou; a tentar {fallback.label}…")
+        candidate_path = candidates_dir / f"{fallback.key}-1.glb"
+        try:
+            runtime = run_local_ai_candidate(
+                fallback,
+                input_path=prepared_input,
+                output_path=candidate_path,
+                cache_dir=cache_dir,
+                seed=seeds[0],
+                texture_resolution=min(1024, int(profile["texture"])),
+                timeout_seconds=settings.reconstruction_timeout_hours * 3600,
+                log_path=log_path,
+                cancel_check=lambda: _check_job_cancelled(db, job),
+            )
+            generated.append({**runtime, "path": str(candidate_path)})
+        except JobCancelled:
+            raise
+        except Exception as error:
+            failures.append(str(error))
+
+    if not generated:
+        raise RuntimeError("Nenhum motor local conseguiu gerar o modelo. " + " · ".join(failures[-2:]))
+
+    selected, reports = select_best_candidate(generated, primary_mask)
+    if float(selected.get("score", 0)) < 52 and len(engines) > 1 and selected.get("engine") != engines[1].key:
+        fallback = engines[1]
+        candidate_path = candidates_dir / f"{fallback.key}-comparison.glb"
+        try:
+            runtime = run_local_ai_candidate(
+                fallback,
+                input_path=prepared_input,
+                output_path=candidate_path,
+                cache_dir=cache_dir,
+                seed=seeds[0],
+                texture_resolution=min(1024, int(profile["texture"])),
+                timeout_seconds=settings.reconstruction_timeout_hours * 3600,
+                log_path=log_path,
+                cancel_check=lambda: _check_job_cancelled(db, job),
+            )
+            generated.append({**runtime, "path": str(candidate_path)})
+            selected, reports = select_best_candidate(generated, primary_mask)
+        except JobCancelled:
+            raise
+        except Exception as error:
+            failures.append(str(error))
+
+    _advance(db, job, stages[4], 100, f"Melhor candidato escolhido: {selected['engine_label']}")
+    texture_mode = str(selected.get("texture_mode", "none"))
+    texture_label = {
+        "uv_texture": "Textura UV gerada localmente",
+        "vertex_colors": "Cores por vértice",
+        "pbr_uniform": "Material PBR uniforme",
+        "none": "Sem material",
+    }.get(texture_mode, texture_mode)
+    _advance(db, job, stages[5], 100, texture_label)
+
+    manifest_path = workspace / "local-ai-candidates.json"
+    manifest = {
+        "pipeline_version": PIPELINE_VERSION,
+        "input": str(prepared_input),
+        "quality_profile": quality_profile,
+        "object_profile": getattr(project, "object_profile", "auto"),
+        "selected": selected,
+        "candidates": reports,
+        "failures": failures,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    db.add(Artifact(
+        project_id=project.id,
+        job_id=job.id,
+        version_id=job.version_id,
+        artifact_type="ai_candidate_report",
+        filename="local-ai-candidates.json",
+        storage_path=str(manifest_path),
+        mime_type="application/json",
+        file_size=manifest_path.stat().st_size,
+        artifact_metadata={"selected_engine": selected["engine"], "candidate_count": len(reports)},
+    ))
+
+    _advance(db, job, stages[6], 20, "A normalizar e verificar o GLB selecionado…")
+    glb_path = artifacts_dir / f"{job.id}.glb"
+    geometry = _convert_to_glb(Path(selected["path"]), glb_path)
+    _advance(db, job, stages[6], 100, "GLB local criado e verificado")
+
+    visual_match = float(selected.get("visual_match_score", 0))
+    geometry_quality = float(selected.get("geometry_quality_score", 0))
+    texture_quality = float(selected.get("texture_quality_score", 0))
+    quality_score = round(min(92.0, visual_match * 0.48 + geometry_quality * 0.34 + texture_quality * 0.18))
+    quality_status = "approved" if quality_score >= 72 else "approved_with_warnings" if quality_score >= 52 else "review_required"
+    warnings = []
+    if quality_status != "approved":
+        warnings.append("A geometria foi inferida a partir de uma única imagem; revê a traseira e as partes finas.")
+    warnings.extend(failures[-1:])
+    job.configuration = {
+        **(job.configuration or {}),
+        "engine": selected["engine_label"],
+        "candidate_count": len(reports),
+        "selected_seed": selected.get("seed"),
+        "single_image_generation": True,
+        "texture_resolution": int(profile["texture"]),
+        "object_profile": getattr(project, "object_profile", "auto"),
+    }
+    db.commit()
+    _finish(
+        db,
+        job,
+        project,
+        glb_path,
+        {
+            "cameras": 1,
+            "input_images": 1,
+            **geometry,
+            "simulated": False,
+            "generative_ai": True,
+            "single_image_generation": True,
+            "inferred_geometry": True,
+            "estimated_geometry": True,
+            "observed_coverage": 35,
+            "visual_match_score": round(visual_match),
+            "geometry_quality_score": round(geometry_quality),
+            "texture_quality_score": round(texture_quality),
+            "visual_fidelity": round(visual_match),
+            "geometric_confidence": min(55, round(geometry_quality)),
+            "quality_score": quality_score,
+            "quality_status": quality_status,
+            "candidates_generated": len(reports),
+            "selected_candidate": reports.index(selected) + 1 if selected in reports else 1,
+            "selected_engine": selected["engine"],
+            "main_component_ratio": selected.get("main_component_ratio", 0),
+            "significant_components": selected.get("significant_components", 0),
+            "texture_mode": texture_label,
+            "texture_generated": bool(selected.get("has_texture") or selected.get("has_vertex_colors")),
+            "has_texture": bool(selected.get("has_texture")),
+            "has_vertex_colors": bool(selected.get("has_vertex_colors")),
+            "has_pbr_material": bool(selected.get("has_pbr_material")),
+            "recovery_warnings": warnings,
+            "result_tier": "ai_generated",
+        },
+        {
+            "simulated": False,
+            "displayable": True,
+            "generative_ai": True,
+            "single_image_generation": True,
+            "engine": selected["engine_label"],
+            "selected_seed": selected.get("seed"),
+            "result_tier": "ai_generated",
+            "estimated_geometry": True,
+            "inferred_geometry": True,
+            "material": texture_mode,
+            "texture_projection": bool(selected.get("has_texture")),
+            "has_texture": bool(selected.get("has_texture")),
+            "has_vertex_colors": bool(selected.get("has_vertex_colors")),
+            "recovery_warnings": warnings,
+            "source_format": ".glb",
+        },
+    )
 
 
 def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):

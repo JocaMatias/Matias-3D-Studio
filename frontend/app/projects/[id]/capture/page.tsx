@@ -159,30 +159,25 @@ export default function Capture() {
     void upload(event.dataTransfer.files);
   }
 
-  const modeMinimum = project?.project_type === "precision_scan" ? 20 : project?.project_type === "hybrid" ? 5 : 1;
-  const modeCopy = project?.project_type === "precision_scan"
+  const isScan = project?.project_type === "reality_scan";
+  const modeMinimum = isScan ? 20 : 1;
+  const modeCopy = isScan
     ? {
-        title: "Digitalização precisa com 20+ fotos",
-        subtitle: "20+ imagens · sobreposição elevada · textura visual repetível",
+        title: "Digitalização real com 20+ fotografias",
+        subtitle: "20+ fotografias reais · mesmo objeto · elevada sobreposição",
         items: ["Duas voltas completas com 70–80% de sobreposição", "Uma volta lateral e outra superior", "Luz suave e exposição constante"],
       }
-    : project?.project_type === "hybrid"
-      ? {
-          title: "Reconstrução híbrida com 5–15 fotos",
-          subtitle: "5–15 imagens · mais vistas observadas, menos zonas inferidas",
-          items: ["Frente, traseira, esquerda e direita", "Uma vista ligeiramente superior", "Mantém o objeto e a distância constantes"],
-        }
-      : {
-          title: "IA Multivista com 1–4 imagens",
-          subtitle: "1–4 imagens · as zonas ocultas são inferidas pela IA",
-          items: ["Marca como principal a vista que melhor define o objeto", "Prefere ângulos complementares, não repetidos", "Mantém forma, materiais e detalhes idênticos"],
-        };
+    : {
+        title: "Criação local com uma imagem",
+        subtitle: "1 imagem principal · SPAR3D Low VRAM · fallback Stable Fast 3D",
+        items: ["Escolhe uma vista a 30–45° que mostre a forma principal", "Usa fundo simples e contraste nítido", "O objeto deve aparecer completo e centrado"],
+      };
 
   const canReconstruct = Boolean(
     report &&
     (report.real_reconstruction_ready ?? report.approved + report.warnings >= modeMinimum) &&
-    engine?.available &&
-    engine.real_reconstruction,
+    (isScan ? engine?.photogrammetry?.available : engine?.local_ai?.available || engine?.mode === "mock") &&
+    engine?.real_reconstruction,
   );
 
   return (
@@ -206,13 +201,13 @@ export default function Capture() {
           >
             <Upload size={36} color="var(--mint)" />
             <h3>{busy ? "A processar…" : "Arrasta fotografias para aqui"}</h3>
-            <p className="sub">ou clica para selecionar vários ficheiros</p>
+            <p className="sub">ou clica para selecionar {isScan ? "vários ficheiros" : "uma imagem"}</p>
             <input
               hidden
               type="file"
               accept="image/jpeg,image/png"
-              multiple
-              disabled={busy}
+              multiple={isScan}
+              disabled={busy || (!isScan && images.length >= 1)}
               onChange={(event: ChangeEvent<HTMLInputElement>) => event.target.files && void upload(event.target.files)}
             />
           </label>
@@ -270,26 +265,16 @@ export default function Capture() {
                   <i><b style={{ width: `${report.input_quality_score ?? report.score ?? 0}%` }} /></i>
                 </div>
                 <div>
-                  <span>Consistência entre vistas</span>
-                  <strong>{report.structural_consistency_estimate ?? 0}%</strong>
-                  <i><b style={{ width: `${report.structural_consistency_estimate ?? 0}%` }} /></i>
+                  <span>{isScan ? "Consistência entre vistas" : "Qualidade da referência"}</span>
+                  <strong>{isScan ? report.structural_consistency_estimate ?? 0 : report.input_quality_score ?? report.score ?? 0}%</strong>
+                  <i><b style={{ width: `${isScan ? report.structural_consistency_estimate ?? 0 : report.input_quality_score ?? report.score ?? 0}%` }} /></i>
                 </div>
                 <div>
-                  <span>Diversidade de ângulos</span>
-                  <strong>{report.view_diversity_estimate ?? 0}%</strong>
-                  <i><b style={{ width: `${report.view_diversity_estimate ?? 0}%` }} /></i>
+                  <span>Cobertura observada estimada</span>
+                  <strong>{report.observed_coverage_estimate ?? 0}%</strong>
+                  <i><b style={{ width: `${report.observed_coverage_estimate ?? 0}%` }} /></i>
                 </div>
-                <div>
-                  <span>Fidelidade visual</span>
-                  <strong>{report.visual_fidelity_estimate ?? 0}%</strong>
-                  <i><b style={{ width: `${report.visual_fidelity_estimate ?? 0}%` }} /></i>
                 </div>
-                <div>
-                  <span>Confiança geométrica</span>
-                  <strong>{report.geometric_confidence_estimate ?? 0}%</strong>
-                  <i><b style={{ width: `${report.geometric_confidence_estimate ?? 0}%` }} /></i>
-                </div>
-              </div>
               {report.next_capture_suggestion && (
                 <p className="suggestion"><strong>Próxima foto:</strong> {report.next_capture_suggestion}</p>
               )}
@@ -303,13 +288,13 @@ export default function Capture() {
           <label className="field" style={{ marginTop: 12 }}>
             <span>Perfil da malha</span>
             <select className="input" value={qualityProfile} onChange={(event) => setQualityProfile(event.target.value)}>
-              <option value="preview">Pré-visualização · ~25 mil faces</option>
-              <option value="standard">Equilibrado · ~60 mil faces</option>
-              <option value="high">Alta qualidade · ~120 mil faces</option>
+              <option value="preview">Rápido · 1 candidato · textura 512 px</option>
+              <option value="standard">Equilibrado · 2 candidatos · textura 1024 px</option>
+              <option value="high">Alta qualidade · 3 candidatos · textura 2048 px</option>
             </select>
           </label>
           <button className="btn primary" style={{ width: "100%", marginTop: 10 }} disabled={!canReconstruct || busy} onClick={() => void reconstruct()}>
-            {project?.project_type === "precision_scan" ? "Iniciar digitalização precisa" : project?.project_type === "hybrid" ? "Iniciar reconstrução híbrida" : "Gerar com IA Multivista"}
+            {isScan ? "Iniciar digitalização real" : "Gerar com IA local"}
           </button>
         </aside>
       </div>

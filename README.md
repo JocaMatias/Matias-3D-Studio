@@ -1,60 +1,52 @@
 # Matias 3D Studio
 
-Estúdio local para criar, validar, comparar e exportar modelos 3D a partir de imagens. A aplicação apresenta apenas três modos de geração, cada um com limites, validação e estratégia próprios.
+Estúdio local para criar, validar, comparar e exportar modelos 3D. A interface separa claramente dois objetivos diferentes:
 
-| Modo | Imagens | Estratégia |
-| --- | ---: | --- |
-| IA Multivista | 1–4 | Hunyuan3D gera vários candidatos, infere zonas ocultas e recupera automaticamente malhas estruturalmente frágeis. |
-| Reconstrução híbrida | 5–15 | As vistas reais reforçam a seleção, a cobertura observada e a projeção de cor; a IA completa zonas não visíveis. |
-| Digitalização precisa | 20+ | COLMAP/OpenMVS tenta recuperar câmaras, geometria densa e textura; se o alinhamento falhar, existe fallback generativo com confiança limitada. |
+| Modo | Estado | Entrada | Resultado |
+| --- | --- | --- | --- |
+| **Criar com IA** | Disponível | Uma imagem principal | Modelo plausível com as zonas invisíveis estimadas localmente por IA |
+| **Digitalizar objeto real** | Em desenvolvimento | Muitas fotografias reais | Reconstrução fotogramétrica baseada no objeto físico |
 
-O intervalo 16–19 continua utilizável no modo híbrido, mas a interface recomenda chegar às 20 vistas para desbloquear a digitalização precisa.
+O modo principal atual funciona sem créditos por geração: usa a GPU NVIDIA do computador e guarda os modelos e pesos localmente.
 
-## O que está implementado
+## Criar com IA
 
-- upload JPEG/PNG em streaming, verificação pela assinatura real e escrita atómica;
-- validação de resolução, exposição, foco, duplicados, consistência e diversidade;
-- segmentação rápida para fundos uniformes e `rembg/u2netp` como fallback;
-- seleção automática de vistas complementares sem assumir que o primeiro upload é frontal;
-- 2, 4 ou 6 candidatos conforme o perfil de qualidade;
-- rejeição de planos parasitas, fragmentação excessiva e componentes principais fracas;
-- perfis de 25k, 60k e 120k faces para preview, standard e alta qualidade;
-- Hunyuan Paint para textura UV quando o runtime CUDA está completo;
-- recuperação em cascata: soldadura e limpeza da malha, sementes adicionais e, como último recurso, um proxy volumétrico fechado marcado como estimado;
-- projeção portátil de cores multivista quando o rasterizador nativo não está disponível;
-- preservação comprovada de material/cor durante a normalização e exportação GLB;
-- versões imutáveis, versão principal, métricas e artefactos separados;
-- fila local, fila inline determinística para testes e Redis/RQ para trabalhos persistentes;
-- migrações Alembic, incluindo conversão dos nomes antigos para os três modos atuais;
-- visualizador com textura, sólido, wireframe, vistas, grelha, luz e ecrã inteiro;
-- diagnóstico de base de dados, armazenamento, GPU, fila e motores 3D.
+O pipeline foi redesenhado para não fundir várias referências contraditórias. Usa uma única imagem principal como âncora:
 
-O triângulo `mock` é apenas uma fixture técnica e nunca é apresentado como reconstrução real.
+```text
+Imagem principal
+→ validação e segmentação
+→ SPAR3D Low VRAM
+→ candidatos sequenciais
+→ comparação de silhueta e integridade
+→ Stable Fast 3D se necessário
+→ seleção do melhor GLB
+→ controlo de qualidade
+→ nova versão no projeto
+```
 
-## Texturização
+### Motores locais
 
-O pipeline nunca usa uma fotografia retangular como material da malha.
+- **SPAR3D Low VRAM:** motor principal para a GPU NVIDIA de 8 GB.
+- **Stable Fast 3D:** fallback local quando o SPAR3D falha ou produz um candidato fraco.
 
-1. Se Hunyuan Paint, os modelos locais e `custom_rasterizer` estiverem disponíveis, gera uma textura UV multivista.
-2. Se esse runtime não estiver disponível ou exceder a VRAM, projeta cor das vistas selecionadas nos vértices e exporta-a no GLB.
-3. Apenas se não existirem referências de cor válidas usa um material PBR uniforme.
+Os dois motores são instalados em ambientes Python separados dentro da distro WSL2 isolada `MatiasAI`. Não entram no Git e não interferem com as dependências do backend Windows.
 
-Na RTX 5060 Laptop de 8 GB, a geração de forma funciona localmente. Hunyuan Paint pode exigir cerca de 16 GB e um runtime CUDA compilado; por isso, a projeção de cor é o fallback seguro para esse hardware.
+### Perfis de geração
 
-## Estrutura e dados
+- **Rápido:** um candidato, textura 512 px.
+- **Equilibrado:** dois candidatos sequenciais, textura 1024 px.
+- **Alta qualidade:** três candidatos sequenciais, textura 2048 px.
 
-- `frontend/`: Next.js 15, TypeScript e React Three Fiber;
-- `backend/`: FastAPI, SQLAlchemy, Alembic, Pillow, rembg, trimesh e Redis/RQ;
-- `backend/storage/`: originais, miniaturas, máscaras, workspaces e artefactos;
-- `backend/studio.db`: base SQLite local com projetos, jobs e versões;
-- `tools/`: motores e modelos locais ignorados pelo Git;
-- `desktop/`: iniciador Windows e ícone.
+Para 8 GB de VRAM, começa por **Rápido** e só depois experimenta **Equilibrado**. Os candidatos são executados um de cada vez para libertar memória entre gerações.
 
-Para consultar a base local, abre `backend/studio.db` com DB Browser for SQLite e com o estúdio parado. Os ficheiros pesados ficam em `backend/storage/`; a base guarda apenas os metadados e caminhos.
+## Instalação base
 
-## Instalação local
+Requisitos da aplicação:
 
-Requisitos: Node.js 20+, Python 3.12–3.14 e uma GPU NVIDIA/CUDA para Hunyuan3D.
+- Node.js 20+;
+- Python para o backend;
+- Git.
 
 ```powershell
 python -m venv .venv
@@ -62,9 +54,35 @@ python -m venv .venv
 python -m pip install -r backend\requirements.txt
 cd frontend
 npm ci
+cd ..
 ```
 
-Início manual em dois terminais:
+## Instalar os motores locais
+
+Os motores exigem adicionalmente:
+
+- Windows 11 com WSL2;
+- GPU NVIDIA e driver compatível com CUDA no WSL;
+- conta Hugging Face, acesso aceite aos modelos e token `Read`.
+
+Na raiz do projeto:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass -Force
+& ".\desktop\install-local-ai-engines.ps1"
+```
+
+O instalador retomável cria/reutiliza a distro `MatiasAI`, fixa as revisões e dependências, descarrega os pesos sem guardar o token, valida os dois motores e gera GLBs reais de smoke test. Os motores nunca são compilados com MSVC no Windows.
+
+Mais detalhes: [`docs/local-ai.md`](docs/local-ai.md).
+
+## Iniciar
+
+```powershell
+& ".\desktop\Matias 3D Studio.bat"
+```
+
+Ou manualmente em dois terminais:
 
 ```powershell
 cd backend
@@ -76,45 +94,55 @@ cd frontend
 npm run dev
 ```
 
-Também podes executar `desktop\Matias 3D Studio.bat`. O iniciador reinicia serviços antigos do próprio Studio, confirma a versão da API e executa `npm ci` quando a versão local do Next.js não coincide com o lockfile. Para criar o atalho, executa uma vez `desktop\install-desktop-shortcut.ps1`.
-
 Interface: `http://localhost:3000`
 API: `http://localhost:8000/docs`
 
-## Fila e testes
+## O que está implementado
 
-O desenvolvimento local usa `QUEUE_MODE=thread`. Os testes definem `QUEUE_MODE=inline`, `RECONSTRUCTION_MODE=mock`, uma base SQLite temporária e armazenamento temporário antes de importar a aplicação. Isto impede alterações na base real e torna regressões presas em `processing` determinísticas.
+- upload JPEG/PNG em streaming com verificação do conteúdo real;
+- imagem principal explícita;
+- perfis de objeto: automático, compacto, partes finas, várias peças, recipiente com pega, mecânico, orgânico e arquitetura;
+- segmentação e entrada PNG com alpha verdadeiro;
+- geração local single-image-to-3D;
+- vários candidatos sequenciais no SPAR3D;
+- fallback Stable Fast 3D;
+- seleção automática por silhueta, componente principal, fragmentação e materiais;
+- distinção entre textura UV, cores por vértice, material uniforme e ausência de material;
+- métricas finais separadas das métricas da imagem de entrada;
+- versões imutáveis e relatório JSON dos candidatos;
+- viewer com textura/cores apenas quando disponíveis, sólido, wireframe e sete vistas;
+- fila local, fila inline para testes e Redis/RQ;
+- migrations Alembic;
+- Docker sem dependência do output `standalone` do Next.js, evitando o bloqueio Windows em `Collecting build traces`.
+
+## Testes
 
 ```powershell
-cd backend
-..\.venv\Scripts\python.exe -m pytest -q
+$env:PYTHONPATH = "backend"
+python -m pytest -q
 
-cd ..\frontend
+cd frontend
+& ".\node_modules\.bin\tsc.cmd" --noEmit
 npm run build
-npm audit --package-lock-only
 ```
 
 ## Docker Compose
 
-O Compose arranca PostgreSQL, Redis, backend, worker RQ e frontend com healthchecks. Por omissão usa `RECONSTRUCTION_MODE=mock`, porque os modelos Hunyuan e executáveis Windows locais não fazem parte das imagens Linux.
+O Compose continua útil para validar frontend, backend, PostgreSQL, Redis e worker. Os motores NVIDIA locais de Windows não são incluídos nas imagens Docker.
 
 ```powershell
 docker compose up --build
 ```
 
-As portas podem ser isoladas sem editar o ficheiro:
+## Digitalizar objeto real
 
-```powershell
-$env:FRONTEND_PORT = "3300"
-$env:BACKEND_PORT = "8800"
-docker compose -p matias3d-verify up --build
-```
+A opção aparece como **Em desenvolvimento**. Quando for retomada, usará um pipeline separado de fotogrametria com COLMAP/OpenMVS. Não será misturada com a geração por IA e não substituirá silenciosamente zonas observadas por geometria inventada.
 
 ## Limitações honestas
 
-- uma a quatro vistas podem produzir um objeto plausível, mas zonas não observadas são inferidas;
-- cinco a quinze vistas melhoram cobertura e seleção, mas não substituem câmaras reais recuperadas;
-- COLMAP precisa de detalhe repetível e sobreposição; muitas imagens não corrigem superfícies lisas, transparentes ou espelhadas;
-- quatro referências geradas por IA de um objeto complexo só funcionam bem se forma, proporções e detalhes forem consistentes entre vistas;
-- a qualidade Meshy-like depende do modelo generativo, VRAM, consistência das referências e tempo disponível;
-- os modelos Hunyuan3D estão sujeitos às respetivas licenças.
+- Uma imagem não contém informação sobre a traseira; essas zonas são inferidas.
+- Objetos transparentes, espelhados, muito finos ou mecanicamente complexos continuam difíceis.
+- O resultado pode ser visualmente convincente sem ser uma cópia métrica do objeto.
+- Os motores dependem do suporte WSL2/CUDA do driver NVIDIA instalado no Windows.
+- A qualidade não é garantida como igual à de serviços comerciais proprietários.
+- Confirma a licença dos modelos antes de distribuição comercial; o funcionamento local não elimina obrigações de licença.

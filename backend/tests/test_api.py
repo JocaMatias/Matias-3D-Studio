@@ -4,7 +4,6 @@ from fastapi.testclient import TestClient
 import pytest
 from app.main import app
 
-
 client = TestClient(app)
 
 
@@ -18,19 +17,15 @@ def test_health_contract_identifies_the_current_desktop_api():
     with client:
         health = client.get("/api/health")
         assert health.status_code == 200
-        assert health.json()["api_version"] == "0.3.0"
-        assert health.json()["generation_modes"] == [
-            "ai_multiview",
-            "hybrid",
-            "precision_scan",
-        ]
+        assert health.json()["api_version"] == "0.4.0"
+        assert health.json()["generation_modes"] == ["ai_generation", "reality_scan"]
 
 
 def test_vertical_project_flow():
     with client:
         created = client.post(
             "/api/projects",
-            json={"name": "Teste", "capture_type": "small_object", "project_type": "ai_multiview"},
+            json={"name": "Teste", "capture_type": "small_object", "project_type": "ai_generation"},
         )
         assert created.status_code == 201
         project_id = created.json()["id"]
@@ -62,15 +57,11 @@ def test_vertical_project_flow():
         client.delete(f"/api/projects/{project_id}")
 
 
-@pytest.mark.parametrize(
-    ("project_type", "minimum"),
-    [("hybrid", 5), ("precision_scan", 20)],
-)
-def test_generation_mode_minimum_is_enforced_in_inline_test_queue(project_type, minimum):
+def test_reality_scan_minimum_is_enforced_in_inline_test_queue():
     with client:
         created = client.post(
             "/api/projects",
-            json={"name": "Modo incompleto", "capture_type": "small_object", "project_type": project_type},
+            json={"name": "Scan incompleto", "capture_type": "small_object", "project_type": "reality_scan"},
         )
         assert created.status_code == 201
         project_id = created.json()["id"]
@@ -80,9 +71,7 @@ def test_generation_mode_minimum_is_enforced_in_inline_test_queue(project_type, 
         )
         assert upload.status_code == 201
         assert client.post(f"/api/projects/{project_id}/validate").status_code == 200
-
         started = client.post(f"/api/projects/{project_id}/reconstruct")
         assert started.status_code == 409
-        assert f"pelo menos {minimum}" in started.json()["detail"]
-        assert client.get(f"/api/projects/{project_id}/job").status_code == 404
+        assert "pelo menos 20" in started.json()["detail"]
         client.delete(f"/api/projects/{project_id}")

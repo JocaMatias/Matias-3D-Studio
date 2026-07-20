@@ -21,36 +21,37 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from mesh_texturing import apply_multiview_vertex_colours
 
 
-def test_progressive_strategy_thresholds():
+def test_public_strategy_has_two_clear_modes():
     assert strategy_for_images(0).key == "insufficient"
-    assert strategy_for_images(1).key == "ai_multiview"
-    assert strategy_for_images(4).key == "ai_multiview"
-    assert strategy_for_images(5).key == "hybrid"
-    assert strategy_for_images(15).key == "hybrid"
-    # 16-19 is an intentional transition range: hybrid remains available and
-    # the UI recommends adding views until precise scanning unlocks at 20.
-    assert strategy_for_images(19).key == "hybrid"
-    assert strategy_for_images(20, "low").key == "precision_scan"
-    assert strategy_for_images(20, "high").key == "precision_scan"
+    assert strategy_for_images(1).key == "ai_generation"
+    assert strategy_for_images(19).key == "ai_generation"
+    assert strategy_for_images(20, "high").key == "reality_scan"
 
 
-def test_explicit_modes_enforce_their_own_minimums():
-    assert strategy_for_project("ai_multiview", 1).key == "ai_multiview"
-    assert strategy_for_project("hybrid", 4).key == "insufficient"
-    assert strategy_for_project("hybrid", 5).key == "hybrid"
-    assert strategy_for_project("precision_scan", 19).key == "insufficient"
-    assert strategy_for_project("precision_scan", 20).key == "precision_scan"
+def test_explicit_modes_enforce_their_own_minimums_and_legacy_aliases():
+    assert strategy_for_project("ai_generation", 1).key == "ai_generation"
+    assert strategy_for_project("ai_multiview", 1).key == "ai_generation"
+    assert strategy_for_project("reality_scan", 19).key == "insufficient"
+    assert strategy_for_project("precision_scan", 20).key == "reality_scan"
 
 
-def test_more_images_raise_geometric_confidence():
-    one = capture_metrics(1, 70, project_type="ai_multiview")
-    four = capture_metrics(4, 70, project_type="ai_multiview")
-    five = capture_metrics(5, 70, project_type="hybrid")
-    fifteen = capture_metrics(15, 70, project_type="hybrid")
-    twenty = capture_metrics(20, 70, "high", "precision_scan")
-    assert one["geometric_confidence_estimate"] < four["geometric_confidence_estimate"]
-    assert five["geometric_confidence_estimate"] < fifteen["geometric_confidence_estimate"]
-    assert fifteen["geometric_confidence_estimate"] < twenty["geometric_confidence_estimate"]
+def test_extra_ai_references_do_not_inflate_single_image_confidence():
+    one = capture_metrics(1, 70, project_type="ai_generation")
+    ten = capture_metrics(10, 70, project_type="ai_generation")
+    scan = capture_metrics(20, 70, "high", "reality_scan")
+    assert one["geometric_confidence_estimate"] == ten["geometric_confidence_estimate"]
+    assert one["observed_coverage_estimate"] == 35
+    assert scan["geometric_confidence_estimate"] > one["geometric_confidence_estimate"]
+
+
+def test_reality_scan_remains_photogrammetry_only():
+    images = [SimpleNamespace(blur_score=22.0, validation_status="approved") for _ in range(24)]
+    trackability = photogrammetry_trackability(images)
+    strategy = strategy_for_images(len(images), trackability["level"])
+    assert strategy.key == "reality_scan"
+    assert strategy.uses_photogrammetry is True
+    assert strategy.uses_generative_ai is False
+
 
 
 def test_handle_views_are_put_in_opposite_multiview_slots(tmp_path: Path):
@@ -76,23 +77,6 @@ def test_handle_views_are_put_in_opposite_multiview_slots(tmp_path: Path):
     mask(3, "right")
     selected = _semantic_handle_order(images, tmp_path)
     assert selected == images
-
-
-def test_smooth_object_uses_precise_mode_with_generative_fallback():
-    images = [SimpleNamespace(blur_score=22.0, validation_status="approved") for _ in range(24)]
-    trackability = photogrammetry_trackability(images)
-    assert trackability["level"] == "low"
-    strategy = strategy_for_images(len(images), trackability["level"])
-    assert strategy.key == "precision_scan"
-    assert strategy.uses_photogrammetry is True
-    assert strategy.uses_generative_ai is True
-
-
-def test_detailed_object_can_enable_hybrid_pipeline():
-    images = [SimpleNamespace(blur_score=65.0, validation_status="approved") for _ in range(24)]
-    trackability = photogrammetry_trackability(images)
-    assert trackability["level"] == "high"
-    assert strategy_for_images(len(images), trackability["level"]).key == "precision_scan"
 
 
 def test_uniform_studio_background_uses_fast_local_mask(tmp_path: Path):

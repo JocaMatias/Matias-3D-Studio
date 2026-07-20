@@ -3,7 +3,7 @@ param([switch]$NoLaunch)
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $PidFile = Join-Path $PSScriptRoot ".pids.json"
-$ExpectedApiVersion = "0.3.0"
+$ExpectedApiVersion = "0.4.0"
 
 function Get-ListeningProcessId {
   param([int]$Port)
@@ -171,7 +171,7 @@ for ($Attempt = 0; $Attempt -lt 120; $Attempt++) {
   $Health = Get-BackendHealth
   $BackendReady = $Health -and
     $Health.api_version -eq $ExpectedApiVersion -and
-    (@($Health.generation_modes) -join ",") -eq "ai_multiview,hybrid,precision_scan"
+    (@($Health.generation_modes) -join ",") -eq "ai_generation,reality_scan"
   $FrontendReady = $null -ne (Get-FrontendResponse)
   if ($BackendReady -and $FrontendReady) { break }
   Start-Sleep -Milliseconds 500

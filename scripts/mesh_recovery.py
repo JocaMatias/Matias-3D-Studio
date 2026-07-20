@@ -14,6 +14,30 @@ import trimesh
 
 
 @dataclass(frozen=True)
+class RepairPolicy:
+    minimum_component_faces: int
+    relative_component_size: float
+    maximum_components: int
+    nearby_gap_ratio: float
+    fill_holes: bool
+    penalize_ground_sheets: bool
+
+
+def repair_policy(object_profile: str = "auto") -> RepairPolicy:
+    policies = {
+        "compact": RepairPolicy(50, 0.006, 24, 0.055, True, True),
+        "handled_container": RepairPolicy(24, 0.0015, 64, 0.14, False, True),
+        "thin_parts": RepairPolicy(8, 0.0002, 192, 0.32, False, True),
+        "multi_component": RepairPolicy(8, 0.00015, 256, 0.38, False, True),
+        "mechanical": RepairPolicy(16, 0.00025, 192, 0.34, False, True),
+        "organic": RepairPolicy(24, 0.0012, 72, 0.15, False, True),
+        "architecture": RepairPolicy(8, 0.00015, 256, 0.35, False, False),
+        "auto": RepairPolicy(20, 0.0008, 96, 0.16, False, True),
+    }
+    return policies.get(object_profile, policies["auto"])
+
+
+@dataclass(frozen=True)
 class TopologyReport:
     main_face_ratio: float
     significant_components: int
@@ -63,66 +87,40 @@ def sanitize_mesh(mesh: trimesh.Trimesh | trimesh.Scene) -> trimesh.Trimesh:
     return cleaned
 
 
-def _dominant_sheet_ratio(mesh: trimesh.Trimesh) -> float:
-    """Detect a thin, connected ground sheet hidden inside one component.
+def _dominant_sheet_ratio(mesh: trimesh.Trimesh, object_profile: str = "auto") -> float:
+    """Detect a likely generated floor near the lower Y boundary.
 
-    Component counting misses a generated floor when it touches the object.  A
-    volumetric object should not devote two adjacent, opposite-facing planar
-    layers to a large fraction of its complete surface area.  Thin legitimate
-    objects are excluded by the extent-ratio guard.
+    A central thin surface can be a wing, shelf or architectural slab.  Only a
+    broad, paired sheet near the lower boundary is treated as floor evidence.
     """
-    if len(mesh.faces) < 12 or float(mesh.area) <= 1e-9:
+    if object_profile == "architecture" or len(mesh.faces) < 12 or float(mesh.area) <= 1e-9:
         return 0.0
     extents = np.maximum(np.asarray(mesh.extents, dtype=float), 1e-9)
+    if float(extents[1] / extents.max()) < 0.12:
+        return 0.0
     centers = np.asarray(mesh.triangles_center, dtype=float)
     normals = np.asarray(mesh.face_normals, dtype=float)
     areas = np.asarray(mesh.area_faces, dtype=float)
     total_area = float(areas.sum())
-    best = 0.0
-    bins = 48
-    for axis in range(3):
-        if float(extents[axis] / extents.max()) < 0.25:
-            continue
-        aligned = np.abs(normals[:, axis]) >= 0.985
-        if int(aligned.sum()) < 4:
-            continue
-        low, high = mesh.bounds[:, axis]
-        if high - low <= 1e-9:
-            continue
-        histogram = np.histogram(
-            centers[aligned, axis],
-            bins=bins,
-            range=(float(low), float(high)),
-            weights=areas[aligned],
-        )[0]
-        positive = aligned & (normals[:, axis] > 0)
-        negative = aligned & (normals[:, axis] < 0)
-        positive_histogram = np.histogram(
-            centers[positive, axis],
-            bins=bins,
-            range=(float(low), float(high)),
-            weights=areas[positive],
-        )[0]
-        negative_histogram = np.histogram(
-            centers[negative, axis],
-            bins=bins,
-            range=(float(low), float(high)),
-            weights=areas[negative],
-        )[0]
-        for index in range(bins):
-            front = float(positive_histogram[index] / total_area)
-            back = float(negative_histogram[index] / total_area)
-            if front >= 0.05 and back >= 0.05:
-                best = max(best, front + back)
-        for index in range(bins - 1):
-            first = float(histogram[index] / total_area)
-            second = float(histogram[index + 1] / total_area)
-            if first >= 0.05 and second >= 0.05:
-                best = max(best, first + second)
-    return best
+    low, high = mesh.bounds[:, 1]
+    span = float(high - low)
+    if span <= 1e-9:
+        return 0.0
+    aligned = np.abs(normals[:, 1]) >= 0.985
+    lower = centers[:, 1] <= low + span * 0.18
+    relevant = aligned & lower
+    if int(relevant.sum()) < 4:
+        return 0.0
+    positive = relevant & (normals[:, 1] > 0)
+    negative = relevant & (normals[:, 1] < 0)
+    positive_area = float(areas[positive].sum() / total_area)
+    negative_area = float(areas[negative].sum() / total_area)
+    if positive_area >= 0.045 and negative_area >= 0.045:
+        return positive_area + negative_area
+    return 0.0
 
 
-def topology_report(mesh: trimesh.Trimesh | trimesh.Scene) -> TopologyReport:
+def topology_report(mesh: trimesh.Trimesh | trimesh.Scene, object_profile: str = "auto") -> TopologyReport:
     """Measure topology after welding, avoiding false fragmentation reports."""
     probe = sanitize_mesh(mesh)
     if not len(probe.faces):
@@ -154,7 +152,7 @@ def topology_report(mesh: trimesh.Trimesh | trimesh.Scene) -> TopologyReport:
             main_face_ratio=float(main_ratio),
             significant_components=int(significant),
             secondary_planar_component=secondary_planar,
-            dominant_sheet_ratio=_dominant_sheet_ratio(probe),
+            dominant_sheet_ratio=_dominant_sheet_ratio(probe, object_profile),
             euler_number=int(main.euler_number),
             watertight=bool(main.is_watertight),
         )
@@ -162,62 +160,91 @@ def topology_report(mesh: trimesh.Trimesh | trimesh.Scene) -> TopologyReport:
         return TopologyReport(0.0, 999, False, 0.0, 2, False)
 
 
+def _bbox_gap(left: trimesh.Trimesh, right: trimesh.Trimesh) -> float:
+    left_min, left_max = np.asarray(left.bounds[0]), np.asarray(left.bounds[1])
+    right_min, right_max = np.asarray(right.bounds[0]), np.asarray(right.bounds[1])
+    gap = np.maximum(0.0, np.maximum(left_min - right_max, right_min - left_max))
+    return float(np.linalg.norm(gap))
+
+
 def repair_candidate(
     mesh: trimesh.Trimesh | trimesh.Scene,
     *,
-    minimum_component_faces: int = 80,
-    relative_component_size: float = 0.012,
-    maximum_components: int = 32,
+    object_profile: str = "auto",
+    minimum_component_faces: int | None = None,
+    relative_component_size: float | None = None,
+    maximum_components: int | None = None,
 ) -> tuple[trimesh.Trimesh, dict]:
-    """Weld a candidate and remove tiny floating islands without hiding failure."""
+    """Weld a candidate and remove only unsupported, distant islands.
+
+    Small components close to the main object are preserved for mechanical and
+    thin-part profiles because they can be wheels, blades, bars or decorations.
+    """
+    policy = repair_policy(object_profile)
+    minimum_component_faces = policy.minimum_component_faces if minimum_component_faces is None else minimum_component_faces
+    relative_component_size = policy.relative_component_size if relative_component_size is None else relative_component_size
+    maximum_components = policy.maximum_components if maximum_components is None else maximum_components
     cleaned = sanitize_mesh(mesh)
-    before = topology_report(cleaned)
+    before = topology_report(cleaned, object_profile)
     if not len(cleaned.faces):
-        return cleaned, {"changed": False, "before": before.as_dict(), "after": before.as_dict()}
-    if (
-        before.main_face_ratio >= 0.92
-        and before.significant_components <= 8
-        and not before.secondary_planar_component
-        and before.dominant_sheet_ratio < 0.20
-    ):
-        return cleaned, {"changed": False, "before": before.as_dict(), "after": before.as_dict()}
+        return cleaned, {"changed": False, "profile": object_profile, "removed_components": [], "before": before.as_dict(), "after": before.as_dict()}
 
     try:
         components = list(cleaned.split(only_watertight=False))
-        components.sort(key=lambda component: len(component.faces), reverse=True)
-        largest_faces = max(1, len(components[0].faces))
+        components.sort(
+            key=lambda component: (float(component.area), float(np.prod(np.maximum(component.extents, 1e-9))), len(component.faces)),
+            reverse=True,
+        )
+        main = components[0]
+        largest_faces = max(1, len(main.faces))
         threshold = max(minimum_component_faces, int(largest_faces * relative_component_size))
-        retained = [component for component in components if len(component.faces) >= threshold]
-        retained = retained[:maximum_components] or components[:1]
+        diagonal = max(float(np.linalg.norm(main.extents)), 1e-8)
+        retained = [main]
+        removed = []
+        for index, component in enumerate(components[1:], start=1):
+            faces = int(len(component.faces))
+            gap_ratio = _bbox_gap(main, component) / diagonal
+            supported_by_size = faces >= threshold
+            supported_by_proximity = gap_ratio <= policy.nearby_gap_ratio and faces >= minimum_component_faces
+            if supported_by_size or supported_by_proximity:
+                retained.append(component)
+            else:
+                removed.append({"index": index, "faces": faces, "gap_ratio": round(gap_ratio, 5), "reason": "small_and_distant"})
+        retained = retained[:maximum_components]
         repaired = sanitize_mesh(trimesh.util.concatenate(retained))
-        # Fill only small/simple boundary loops. trimesh's implementation will
-        # leave complex openings untouched instead of inventing large surfaces.
-        try:
-            trimesh.repair.fill_holes(repaired)
-            trimesh.repair.fix_normals(repaired, multibody=True)
-        except Exception:
-            pass
+        if policy.fill_holes:
+            try:
+                trimesh.repair.fill_holes(repaired)
+                trimesh.repair.fix_normals(repaired, multibody=True)
+            except Exception:
+                pass
     except Exception:
         repaired = cleaned
+        removed = []
 
-    after = topology_report(repaired)
+    after = topology_report(repaired, object_profile)
     return repaired, {
         "changed": bool(len(repaired.faces) != len(cleaned.faces) or after != before),
+        "profile": object_profile,
+        "removed_components": removed,
         "before": before.as_dict(),
         "after": after.as_dict(),
     }
 
 
-def is_usable_topology(details: dict, score: float) -> bool:
+def is_usable_topology(details: dict, score: float, object_profile: str = "auto") -> bool:
     """Conservative acceptance rule shared by generation and recovery paths."""
+    policy = repair_policy(object_profile)
+    component_limit = policy.maximum_components
+    sheet_failure = policy.penalize_ground_sheets and float(details.get("dominant_sheet_ratio", 0.0)) >= 0.20
     return not (
         score < 35
-        or float(details.get("main_face_ratio", 0)) < 0.45
-        or bool(details.get("secondary_planar_component", False))
-        or float(details.get("dominant_sheet_ratio", 0.0)) >= 0.20
+        or float(details.get("main_face_ratio", 0)) < (0.30 if object_profile in {"mechanical", "multi_component", "thin_parts", "architecture"} else 0.45)
+        or (bool(details.get("secondary_planar_component", False)) and object_profile not in {"architecture", "mechanical", "thin_parts"})
+        or sheet_failure
         or (
-            int(details.get("significant_components", 999)) > 24
-            and float(details.get("main_face_ratio", 0)) < 0.80
+            int(details.get("significant_components", 999)) > component_limit
+            and float(details.get("main_face_ratio", 0)) < 0.55
         )
     )
 

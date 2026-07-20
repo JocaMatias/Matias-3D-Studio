@@ -7,7 +7,7 @@ import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
 type ViewMode = "textured" | "solid" | "wireframe";
-type CameraView = "perspective" | "front" | "top";
+type CameraView = "perspective" | "front" | "back" | "left" | "right" | "top" | "bottom";
 
 function Model({ url, mode }: { url: string; mode: ViewMode }) {
   const { scene } = useGLTF(url);
@@ -44,7 +44,11 @@ function CameraPosition({ view }: { view: CameraView }) {
     const positions: Record<CameraView, [number, number, number]> = {
       perspective: [3.2, 2.25, 5.2],
       front: [0, 0.4, 5.8],
+      back: [0, 0.4, -5.8],
+      left: [-5.8, 0.4, 0],
+      right: [5.8, 0.4, 0],
       top: [0.001, 6.2, 0.001],
+      bottom: [0.001, -6.2, 0.001],
     };
     camera.position.set(...positions[view]);
     camera.lookAt(0, 0, 0);
@@ -53,14 +57,27 @@ function CameraPosition({ view }: { view: CameraView }) {
   return null;
 }
 
-export default function Viewer({ url }: { url: string }) {
+export default function Viewer({
+  url,
+  hasTexture = true,
+  hasVertexColors = false,
+}: {
+  url: string;
+  hasTexture?: boolean;
+  hasVertexColors?: boolean;
+}) {
   const root = useRef<HTMLDivElement>(null);
-  const [mode, setMode] = useState<ViewMode>("textured");
+  const canShowOriginal = hasTexture || hasVertexColors;
+  const [mode, setMode] = useState<ViewMode>(canShowOriginal ? "textured" : "solid");
   const [view, setView] = useState<CameraView>("perspective");
   const [grid, setGrid] = useState(true);
   const [rotate, setRotate] = useState(true);
   const [light, setLight] = useState(1);
   const [background, setBackground] = useState<"dark" | "light">("dark");
+
+  useEffect(() => {
+    if (!canShowOriginal && mode === "textured") setMode("solid");
+  }, [canShowOriginal, mode]);
 
   async function fullscreen() {
     if (!document.fullscreenElement) await root.current?.requestFullscreen();
@@ -70,12 +87,16 @@ export default function Viewer({ url }: { url: string }) {
   return (
     <div className="viewer" ref={root}>
       <div className="viewer-toolbar" aria-label="Ferramentas do visualizador 3D">
-        <button className={`viewer-button ${mode === "textured" ? "active" : ""}`} onClick={() => setMode("textured")} title="Texturizado"><ImageIcon size={16} /> Textura</button>
+        <button className={`viewer-button ${mode === "textured" ? "active" : ""}`} disabled={!canShowOriginal} onClick={() => setMode("textured")} title={canShowOriginal ? (hasTexture ? "Texturizado" : "Cores por vértice") : "Textura indisponível nesta versão"}><ImageIcon size={16} /> {hasTexture ? "Textura" : hasVertexColors ? "Cores" : "Sem textura"}</button>
         <button className={`viewer-button ${mode === "solid" ? "active" : ""}`} onClick={() => setMode("solid")} title="Material sólido"><Box size={16} /> Sólido</button>
         <button className={`viewer-button ${mode === "wireframe" ? "active" : ""}`} onClick={() => setMode("wireframe")} title="Wireframe"><Triangle size={16} /> Malha</button>
-        <button className="viewer-button" onClick={() => setView("perspective")} title="Repor vista"><RotateCcw size={16} /></button>
-        <button className="viewer-button" onClick={() => setView("front")} title="Vista frontal">Frente</button>
-        <button className="viewer-button" onClick={() => setView("top")} title="Vista superior">Topo</button>
+        <button className="viewer-button" onClick={() => setView("perspective")} title="Perspetiva"><RotateCcw size={16} /></button>
+        <button className="viewer-button" onClick={() => setView("front")}>Frente</button>
+        <button className="viewer-button" onClick={() => setView("back")}>Trás</button>
+        <button className="viewer-button" onClick={() => setView("left")}>Esq.</button>
+        <button className="viewer-button" onClick={() => setView("right")}>Dir.</button>
+        <button className="viewer-button" onClick={() => setView("top")}>Topo</button>
+        <button className="viewer-button" onClick={() => setView("bottom")}>Base</button>
         <button className={`viewer-button ${grid ? "active" : ""}`} onClick={() => setGrid((value) => !value)} title="Mostrar grelha"><Grid3X3 size={16} /></button>
         <button className={`viewer-button ${rotate ? "active" : ""}`} onClick={() => setRotate((value) => !value)} title="Rotação automática">{rotate ? <Pause size={16} /> : <Play size={16} />}</button>
         <button className="viewer-button" onClick={() => setBackground((value) => value === "dark" ? "light" : "dark")} title="Alternar fundo"><Sun size={16} /></button>

@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     hunyuan_root: Path = PROJECT_ROOT / "tools" / "Hunyuan3D-2"
     hunyuan_python: Path = PROJECT_ROOT / "tools" / "hunyuan-env" / "python.exe"
     hunyuan_model_cache: Path = PROJECT_ROOT / "tools" / "hunyuan-models"
+    spar3d_root: Path = PROJECT_ROOT / "tools" / "stable-point-aware-3d"
+    spar3d_python: Path = PROJECT_ROOT / "tools" / "spar3d-env" / "Scripts" / "python.exe"
+    sf3d_root: Path = PROJECT_ROOT / "tools" / "stable-fast-3d"
+    sf3d_python: Path = PROJECT_ROOT / "tools" / "sf3d-env" / "Scripts" / "python.exe"
+    local_ai_model_cache: Path = PROJECT_ROOT / "tools" / "local-ai-models"
+    local_ai_runtime: str = "wsl"
+    local_ai_wsl_distro: str = "MatiasAI"
     # Shape generation is only as good as the alpha masks it receives.  IS-Net
     # is materially better than the 4.6 MB u2netp model on pale, reflective and
     # thin objects; on this workstation one session processes an orbit quickly

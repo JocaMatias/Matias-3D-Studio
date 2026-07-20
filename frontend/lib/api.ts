@@ -1,6 +1,6 @@
 export const API = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
-export type ProjectType = "ai_multiview" | "hybrid" | "precision_scan";
+export type ProjectType = "ai_generation" | "reality_scan";
 export type Project = {
   id: string;
   name: string;
@@ -8,6 +8,7 @@ export type Project = {
   capture_type: string;
   project_type: ProjectType;
   category: string;
+  object_profile: string;
   status: string;
   created_at: string;
   updated_at: string;
@@ -67,7 +68,15 @@ export type Artifact = {
   artifact_metadata: Record<string, unknown>;
   created_at: string;
 };
-export type Engine = { mode: string; available: boolean; real_reconstruction: boolean; message: string; pipeline?: string | null };
+export type Engine = {
+  mode: string;
+  available: boolean;
+  real_reconstruction: boolean;
+  message: string;
+  pipeline?: string | null;
+  local_ai?: { available: boolean; selected?: string | null; selected_label?: string | null; message: string };
+  photogrammetry?: { available: boolean };
+};
 
 function apiErrorMessage(detail: unknown): string {
   if (typeof detail === "string" && detail.trim()) return detail;
@@ -125,7 +134,6 @@ export const statusLabel: Record<string, string> = {
   cancelled: "Cancelado",
 };
 export const projectTypeLabel: Record<string, string> = {
-  ai_multiview: "IA Multivista",
-  hybrid: "Reconstrução híbrida",
-  precision_scan: "Digitalização precisa",
+  ai_generation: "Criar com IA",
+  reality_scan: "Digitalizar objeto real",
 };

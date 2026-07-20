@@ -5,6 +5,47 @@ import trimesh
 from PIL import Image
 
 
+
+def estimate_base_colour(images: list[Image.Image]) -> np.ndarray:
+    """Estimate foreground albedo without letting white backgrounds/highlights win."""
+    samples: list[np.ndarray] = []
+    for image in images:
+        thumbnail = image.convert("RGBA").copy()
+        thumbnail.thumbnail((384, 384), Image.Resampling.LANCZOS)
+        rgba = np.asarray(thumbnail, dtype=np.uint8)
+        pixels = rgba[rgba[:, :, 3] > 180, :3]
+        if not len(pixels):
+            continue
+        step = max(1, len(pixels) // 25000)
+        samples.append(pixels[::step])
+    if not samples:
+        return np.array([180, 180, 180, 255], dtype=np.uint8)
+
+    pixels = np.concatenate(samples, axis=0).astype(np.float32)
+    luminance = pixels @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    low, high = np.percentile(luminance, [2.0, 98.0])
+    pixels = pixels[(luminance >= low) & (luminance <= high)]
+    if not len(pixels):
+        pixels = np.concatenate(samples, axis=0).astype(np.float32)
+
+    maximum = np.maximum(pixels.max(axis=1), 1.0)
+    saturation = (pixels.max(axis=1) - pixels.min(axis=1)) / maximum
+    saturated = pixels[saturation > 0.18]
+    # When a meaningful coloured region exists, do not let neutral white
+    # highlights or a small leaked backdrop dominate the fallback material.
+    working = saturated if len(saturated) >= max(64, int(len(pixels) * 0.12)) else pixels
+    quantized = np.clip((working / 32).astype(np.int16), 0, 7)
+    keys = quantized[:, 0] * 64 + quantized[:, 1] * 8 + quantized[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    dominant = int(values[np.argmax(counts)])
+    centre = np.array([(dominant // 64) * 32 + 16, ((dominant // 8) % 8) * 32 + 16, (dominant % 8) * 32 + 16])
+    distances = np.linalg.norm(working - centre[None, :], axis=1)
+    cluster = working[distances <= 72]
+    if len(cluster) < 32:
+        cluster = working
+    rgb = np.median(cluster, axis=0)
+    return np.r_[np.clip(np.rint(rgb), 0, 255).astype(np.uint8), 255]
+
 def apply_pbr_material(mesh, base_colour: np.ndarray):
     material = trimesh.visual.material.PBRMaterial(
         name="AI PBR material",

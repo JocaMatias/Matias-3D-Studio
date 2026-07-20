@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument("--candidates", type=int, default=3)
     parser.add_argument("--target-faces", type=int, default=60000)
     parser.add_argument("--category", default="generic")
+    parser.add_argument("--object-profile", default="auto")
     parser.add_argument("--texture", action="store_true")
     parser.add_argument("--texture-model")
     parser.add_argument("--project-colors", action="store_true")
@@ -61,6 +62,7 @@ from mesh_texturing import (
     apply_multiview_uv_texture,
     apply_multiview_vertex_colours,
     apply_pbr_material,
+    estimate_base_colour,
 )
 
 
@@ -269,6 +271,7 @@ def candidate_score(
             "euler_number": 2,
             "watertight": False,
             "handle_expected": handle_expected,
+        "object_profile": args.object_profile,
             "handle_topology": False,
             "main_face_ratio": 0.0,
             "significant_components": 999,
@@ -284,7 +287,7 @@ def candidate_score(
     generated_aspect = float(max(extents[0], extents[2]) / extents[1])
     aspect_error = abs(float(np.log(generated_aspect / max(expected_aspect, 1e-6))))
     finite = bool(np.isfinite(mesh.vertices).all())
-    report = topology_report(mesh)
+    report = topology_report(mesh, args.object_profile)
     euler_number = report.euler_number
     watertight = report.watertight
     main_face_ratio = report.main_face_ratio
@@ -347,27 +350,6 @@ def candidate_score(
     return score, details
 
 
-def estimate_base_colour(images: list[Image.Image]) -> np.ndarray:
-    samples = []
-    for image in images:
-        thumbnail = image.copy()
-        thumbnail.thumbnail((384, 384), Image.Resampling.LANCZOS)
-        rgba = np.asarray(thumbnail)
-        pixels = rgba[rgba[:, :, 3] > 220, :3]
-        if not len(pixels):
-            continue
-        luminance = pixels.mean(axis=1)
-        low, high = np.percentile(luminance, [8, 97])
-        neutral = pixels[(luminance >= low) & (luminance <= high)]
-        samples.append(neutral[:: max(1, len(neutral) // 20000)])
-    if not samples:
-        return np.array([230, 230, 230, 255], dtype=np.uint8)
-    # Estimate de-lit albedo from the bright side of the object instead of
-    # baking photographed shadows into the material.
-    rgb = np.percentile(np.concatenate(samples, axis=0), 90, axis=0)
-    return np.r_[np.clip(np.rint(rgb), 0, 255).astype(np.uint8), 255]
-
-
 def optimize_mesh(mesh, target_faces: int):
     original_faces = int(len(mesh.faces))
     try:
@@ -401,7 +383,10 @@ def refine_surface(
     is accepted only if topology remains safe and silhouette support does not
     regress, so detailed or thin objects keep their unsmoothed geometry.
     """
-    iterations = {
+    if args.object_profile in {"thin_parts", "mechanical", "multi_component", "architecture"}:
+        iterations = 0
+    else:
+        iterations = {
         "product": 4,
         "character": 4,
         "generic": 2,
@@ -409,7 +394,7 @@ def refine_surface(
         "vehicle": 2,
         "furniture": 2,
         "architecture": 0,
-    }.get(category, 2)
+        }.get(category, 2)
     baseline_evidence = multiview_silhouette_evidence(mesh, group_images, all_images)
     baseline_score, baseline_details = candidate_score(
         mesh, expected_aspect, handle_expected, baseline_evidence
@@ -433,7 +418,7 @@ def refine_surface(
             >= float(baseline_evidence.get("all_view_silhouette", 0.0)) - 0.006
         )
         if evidence_ok and refined_score >= baseline_score - 1.25 and is_usable_topology(
-            refined_details, refined_score
+            refined_details, refined_score, args.object_profile
         ):
             return refined, True, refined_details
     except Exception as error:
@@ -452,7 +437,7 @@ def main():
     conditioning_indices = sorted({index for group in view_groups for index in group})
     conditioning_images = [images[index] for index in conditioning_indices]
     expected_aspect = expected_silhouette_aspect(conditioning_images)
-    handle_expected = expects_handle_topology(images)
+    handle_expected = args.object_profile == "handled_container" and expects_handle_topology(images)
     base_colour = estimate_base_colour(images)
 
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
@@ -474,7 +459,7 @@ def main():
     for index in range(maximum_attempts):
         # Extra seeds are recovery attempts and only run when the normal budget
         # failed to produce a safe topology.
-        if index >= candidate_count and best_mesh is not None and is_usable_topology(best_details, best_score):
+        if index >= candidate_count and best_mesh is not None and is_usable_topology(best_details, best_score, args.object_profile):
             break
         group_index = index % len(view_groups)
         group = view_groups[group_index]
@@ -506,7 +491,7 @@ def main():
         cleaned_mesh = sanitize_mesh(raw_mesh)
         raw_evidence = multiview_silhouette_evidence(cleaned_mesh, group_images, images)
         raw_score, raw_details = candidate_score(cleaned_mesh, group_aspect, handle_expected, raw_evidence)
-        repaired_mesh, repair = repair_candidate(cleaned_mesh)
+        repaired_mesh, repair = repair_candidate(cleaned_mesh, object_profile=args.object_profile)
         if repair["changed"]:
             repaired_evidence = multiview_silhouette_evidence(repaired_mesh, group_images, images)
         else:
@@ -522,8 +507,8 @@ def main():
             and (
                 repaired_score > raw_score + 2
                 or (
-                    not is_usable_topology(raw_details, raw_score)
-                    and is_usable_topology(repaired_details, repaired_score)
+                    not is_usable_topology(raw_details, raw_score, args.object_profile)
+                    and is_usable_topology(repaired_details, repaired_score, args.object_profile)
                 )
             )
         )
@@ -566,7 +551,7 @@ def main():
     result_tier = "ai_assisted"
     recovery_mode = str(best_details.get("recovery_mode", "none"))
     recovery_warnings = []
-    if best_mesh is None or not is_usable_topology(best_details, best_score):
+    if best_mesh is None or not is_usable_topology(best_details, best_score, args.object_profile):
         best_mesh, recovery_mode = build_estimated_proxy(best_mesh, expected_aspect)
         best_score, proxy_details = candidate_score(best_mesh, expected_aspect, handle_expected)
         proxy_details.update(
@@ -668,6 +653,7 @@ def main():
         "candidate_errors": candidate_errors,
         "estimated_geometry": result_tier == "estimated",
         "inferred_geometry": True,
+        "object_profile": args.object_profile,
         "handle_expected": handle_expected,
         "handle_preserved": handle_preserved,
         "surface_smoothed": surface_smoothed,

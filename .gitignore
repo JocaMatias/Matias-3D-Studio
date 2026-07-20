@@ -14,3 +14,7 @@ backend/storage/*
 .env
 tools/*
 !tools/.gitkeep
+.matias-backups/
+.matias-install-logs/
+.matias-test-temp/
+.matias-update-temp/

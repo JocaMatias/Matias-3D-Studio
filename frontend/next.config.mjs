@@ -1,10 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: 'standalone',
-  // On Windows the parallel webpack build worker can publish the shared
-  // server chunks after page-data collection has already started, producing
-  // intermittent "Cannot find module ./<chunk>.js" failures. A single build
-  // coordinator is slower by a few seconds but deterministic.
+  // The desktop build runs with `next start`. Keeping output tracing disabled
+  // avoids the Windows-only hang in "Collecting build traces". The Docker
+  // image installs production dependencies instead of relying on standalone.
   experimental: { webpackBuildWorker: false },
 };
+
 export default nextConfig;
