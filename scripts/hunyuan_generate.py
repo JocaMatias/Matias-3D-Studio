@@ -52,7 +52,6 @@ from scipy.ndimage import label
 
 from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
 from mesh_recovery import (
-    build_estimated_proxy,
     is_usable_topology,
     repair_candidate,
     sanitize_mesh,
@@ -125,7 +124,12 @@ def expected_silhouette_aspect(images: list[Image.Image]) -> float:
         alpha = np.asarray(image.getchannel("A")) > 127
         ys, xs = np.where(alpha)
         if len(xs):
-            aspects.append((xs.max() - xs.min() + 1) / max(ys.max() - ys.min() + 1, 1))
+            points = np.column_stack((xs - xs.mean(), ys - ys.mean()))
+            axis = np.linalg.eigh(np.cov(points, rowvar=False))[1][:, -1]
+            across = np.array([-axis[1], axis[0]])
+            major = np.ptp(points @ axis)
+            minor = np.ptp(points @ across)
+            aspects.append(max(major, minor) / max(min(major, minor), 1.0))
     return float(np.median(aspects)) if aspects else 1.0
 
 
@@ -229,6 +233,19 @@ def silhouette_similarity(observed: np.ndarray, rendered: np.ndarray) -> float:
     return float(np.clip(iou * 0.76 + (1.0 - profile_error) * 0.24, 0.0, 1.0))
 
 
+def silhouette_overlap(observed: np.ndarray, rendered: np.ndarray) -> dict[str, float]:
+    """Report asymmetric support so excess geometry cannot hide behind IoU."""
+    intersection = float(np.logical_and(observed, rendered).sum())
+    observed_area = float(observed.sum())
+    rendered_area = float(rendered.sum())
+    return {
+        "similarity": silhouette_similarity(observed, rendered),
+        "precision": intersection / max(rendered_area, 1.0),
+        "recall": intersection / max(observed_area, 1.0),
+        "area_ratio": rendered_area / max(observed_area, 1.0),
+    }
+
+
 def multiview_silhouette_evidence(
     mesh: trimesh.Trimesh,
     group_images: list[Image.Image],
@@ -236,22 +253,74 @@ def multiview_silhouette_evidence(
 ) -> dict[str, float]:
     rendered = rasterized_mesh_silhouettes(mesh)
     slots = ["front", "left", "back", "right"]
-    ordered_scores = [
-        silhouette_similarity(normalized_observed_mask(image), rendered[slot])
+    ordered_metrics = [
+        silhouette_overlap(normalized_observed_mask(image), rendered[slot])
         for image, slot in zip(group_images, slots)
     ]
-    variants = [*rendered.values(), *[np.fliplr(mask) for mask in rendered.values()]]
-    coverage_scores = []
+    variants = []
+    angles = range(0, 180, 15) if len(all_images) == 1 else (0,)
+    for mask in rendered.values():
+        source = Image.fromarray((mask * 255).astype(np.uint8))
+        for angle in angles:
+            rotated = np.asarray(
+                source.rotate(angle, resample=Image.Resampling.NEAREST, expand=False)
+            ) > 127
+            variants.extend((rotated, np.fliplr(rotated)))
+    coverage_metrics = []
     for image in all_images:
         observed = normalized_observed_mask(image)
-        coverage_scores.append(max(silhouette_similarity(observed, candidate) for candidate in variants))
-    ordered = float(np.mean(ordered_scores)) if ordered_scores else 0.0
+        coverage_metrics.append(max(
+            (silhouette_overlap(observed, candidate) for candidate in variants),
+            key=lambda metric: metric["similarity"],
+        ))
+    coverage_scores = [metric["similarity"] for metric in coverage_metrics]
+    ordered_scores = [metric["similarity"] for metric in ordered_metrics]
+    ordered = (
+        max(coverage_scores)
+        if len(group_images) == 1 and coverage_scores
+        else float(np.mean(ordered_scores)) if ordered_scores else 0.0
+    )
     coverage = float(np.mean(coverage_scores)) if coverage_scores else ordered
+    selected_metrics = coverage_metrics or ordered_metrics
     return {
         "ordered_silhouette": ordered,
         "all_view_silhouette": coverage,
         "silhouette_evidence": ordered * 0.62 + coverage * 0.38,
+        "silhouette_precision": float(np.mean([metric["precision"] for metric in selected_metrics])) if selected_metrics else 0.0,
+        "silhouette_recall": float(np.mean([metric["recall"] for metric in selected_metrics])) if selected_metrics else 0.0,
+        "silhouette_area_ratio": float(np.mean([metric["area_ratio"] for metric in selected_metrics])) if selected_metrics else 0.0,
     }
+
+
+def orient_single_view_for_display(
+    mesh: trimesh.Trimesh,
+    image: Image.Image,
+) -> tuple[trimesh.Trimesh, str, float]:
+    """Choose the lateral pose that exposes the most reference-supported detail."""
+    observed = normalized_observed_mask(image)
+    rendered = rasterized_mesh_silhouettes(mesh)
+    best = (float("-inf"), "front")
+    for slot in ("front", "left", "back", "right"):
+        source = Image.fromarray((rendered[slot] * 255).astype(np.uint8))
+        score = max(
+            silhouette_similarity(
+                observed,
+                np.asarray(source.rotate(angle, resample=Image.Resampling.NEAREST)) > 127,
+            )
+            for angle in range(0, 180, 15)
+        )
+        if score > best[0]:
+            best = (score, slot)
+    yaw = {"front": 0.0, "left": 90.0, "back": 180.0, "right": -90.0}[best[1]]
+    radians = np.deg2rad(yaw)
+    cosine, sine = np.cos(radians), np.sin(radians)
+    transform = np.eye(4)
+    transform[:3, :3] = np.array(
+        [[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]]
+    )
+    oriented = mesh.copy()
+    oriented.apply_transform(transform)
+    return oriented, best[1], float(best[0])
 
 
 def candidate_score(
@@ -271,7 +340,7 @@ def candidate_score(
             "euler_number": 2,
             "watertight": False,
             "handle_expected": handle_expected,
-        "object_profile": args.object_profile,
+            "object_profile": args.object_profile,
             "handle_topology": False,
             "main_face_ratio": 0.0,
             "significant_components": 999,
@@ -280,11 +349,14 @@ def candidate_score(
             "ordered_silhouette": 0.0,
             "all_view_silhouette": 0.0,
             "silhouette_evidence": 0.0,
+            "silhouette_precision": 0.0,
+            "silhouette_recall": 0.0,
+            "silhouette_area_ratio": 0.0,
         }
         return -100.0, details
-    extents = np.maximum(np.asarray(mesh.extents, dtype=float), 1e-6)
-    # Hunyuan shape space uses Y as its upright axis.
-    generated_aspect = float(max(extents[0], extents[2]) / extents[1])
+    extents = np.sort(np.maximum(np.asarray(mesh.extents, dtype=float), 1e-6))
+    generated_aspect = float(extents[2] / extents[1])
+    volumetric_depth_ratio = float(extents[0] / extents[1])
     aspect_error = abs(float(np.log(generated_aspect / max(expected_aspect, 1e-6))))
     finite = bool(np.isfinite(mesh.vertices).all())
     report = topology_report(mesh, args.object_profile)
@@ -294,16 +366,22 @@ def candidate_score(
     significant_components = report.significant_components
     secondary_planar = report.secondary_planar_component
     dominant_sheet_ratio = report.dominant_sheet_ratio
-    score = 100.0 - min(75.0, aspect_error * 62.0)
+    # Leave headroom for evidence bonuses.  The previous 100-point starting
+    # value made merely plausible candidates display a misleading perfect
+    # score after clamping, even with only ~60% silhouette support.
+    score = 88.0 - min(75.0, aspect_error * 62.0)
     if not finite or face_count < 1000:
         score -= 80
-    if generated_aspect < 0.45 or generated_aspect > 3.2:
+    if generated_aspect < 1.0 or generated_aspect > 12.0:
         score -= 20
+    minimum_volume = 0.06 if args.object_profile == "thin_parts" else 0.10
+    if volumetric_depth_ratio < minimum_volume:
+        score -= 70.0 * (1.0 - volumetric_depth_ratio / minimum_volume)
     score += (main_face_ratio - 0.70) * 45
     score -= max(0, significant_components - 6) * 1.6
     if secondary_planar:
         score -= 35
-    if dominant_sheet_ratio >= 0.20:
+    if dominant_sheet_ratio >= 0.20 and args.object_profile != "thin_parts":
         score -= min(75.0, 40.0 + (dominant_sheet_ratio - 0.20) * 180.0)
     # A handle is topological, not merely a wide silhouette.  Prefer a genus-1
     # candidate when multiple photographs clearly show its enclosed opening.
@@ -322,6 +400,19 @@ def candidate_score(
     if evidence:
         silhouette_evidence = float(evidence.get("silhouette_evidence", 0.0))
         score += (silhouette_evidence - 0.58) * 105
+        silhouette_precision = float(evidence.get("silhouette_precision", 0.0))
+        silhouette_recall = float(evidence.get("silhouette_recall", 0.0))
+        area_ratio = float(evidence.get("silhouette_area_ratio", 1.0))
+        # Precision answers the crucial question IoU alone misses: how much of
+        # the generated silhouette is actually supported by the photograph?
+        # Large invented wings/floors now lose decisively against a cleaner
+        # candidate even when both explain the main body.
+        score += (silhouette_precision - 0.72) * 82
+        score += (silhouette_recall - 0.68) * 24
+        if silhouette_precision < 0.58:
+            score -= (0.58 - silhouette_precision) * 120
+        if area_ratio > 1.45:
+            score -= min(32.0, (area_ratio - 1.45) * 28.0)
         if float(evidence.get("all_view_silhouette", 0.0)) < 0.48:
             score -= 24
     else:
@@ -329,11 +420,15 @@ def candidate_score(
             "ordered_silhouette": 0.0,
             "all_view_silhouette": 0.0,
             "silhouette_evidence": 0.0,
+            "silhouette_precision": 0.0,
+            "silhouette_recall": 0.0,
+            "silhouette_area_ratio": 0.0,
         }
     details = {
         "score": round(max(0.0, score), 2),
         "expected_aspect": round(expected_aspect, 4),
         "generated_aspect": round(generated_aspect, 4),
+        "volumetric_depth_ratio": round(volumetric_depth_ratio, 4),
         "faces": face_count,
         "euler_number": euler_number,
         "watertight": watertight,
@@ -346,6 +441,9 @@ def candidate_score(
         "ordered_silhouette": round(float(evidence.get("ordered_silhouette", 0.0)), 4),
         "all_view_silhouette": round(float(evidence.get("all_view_silhouette", 0.0)), 4),
         "silhouette_evidence": round(float(evidence.get("silhouette_evidence", 0.0)), 4),
+        "silhouette_precision": round(float(evidence.get("silhouette_precision", 0.0)), 4),
+        "silhouette_recall": round(float(evidence.get("silhouette_recall", 0.0)), 4),
+        "silhouette_area_ratio": round(float(evidence.get("silhouette_area_ratio", 0.0)), 4),
     }
     return score, details
 
@@ -383,18 +481,26 @@ def refine_surface(
     is accepted only if topology remains safe and silhouette support does not
     regress, so detailed or thin objects keep their unsmoothed geometry.
     """
-    if args.object_profile in {"thin_parts", "mechanical", "multi_component", "architecture"}:
-        iterations = 0
-    else:
-        iterations = {
-        "product": 4,
-        "character": 4,
-        "generic": 2,
-        "other": 2,
-        "vehicle": 2,
-        "furniture": 2,
-        "architecture": 0,
-        }.get(category, 2)
+    profile_iterations = {
+        "thin_parts": 3,
+        "mechanical": 5,
+        "multi_component": 3,
+        "architecture": 1,
+        "organic": 7,
+        "compact": 5,
+        "handled_container": 4,
+        "auto": 4,
+    }
+    category_iterations = {
+        "product": 5,
+        "character": 7,
+        "generic": 4,
+        "other": 4,
+        "vehicle": 5,
+        "furniture": 3,
+        "architecture": 1,
+    }
+    iterations = profile_iterations.get(args.object_profile, category_iterations.get(category, 4))
     baseline_evidence = multiview_silhouette_evidence(mesh, group_images, all_images)
     baseline_score, baseline_details = candidate_score(
         mesh, expected_aspect, handle_expected, baseline_evidence
@@ -405,19 +511,24 @@ def refine_surface(
         refined = mesh.copy()
         trimesh.smoothing.filter_taubin(
             refined,
-            lamb=0.32,
-            nu=0.34,
+            lamb=0.38,
+            nu=0.40,
             iterations=iterations,
         )
+        trimesh.repair.fix_normals(refined, multibody=True)
         refined_evidence = multiview_silhouette_evidence(refined, group_images, all_images)
         refined_score, refined_details = candidate_score(
             refined, expected_aspect, handle_expected, refined_evidence
         )
         evidence_ok = (
             float(refined_evidence.get("all_view_silhouette", 0.0))
-            >= float(baseline_evidence.get("all_view_silhouette", 0.0)) - 0.006
+            >= float(baseline_evidence.get("all_view_silhouette", 0.0)) - 0.012
         )
-        if evidence_ok and refined_score >= baseline_score - 1.25 and is_usable_topology(
+        precision_ok = (
+            float(refined_evidence.get("silhouette_precision", 0.0))
+            >= float(baseline_evidence.get("silhouette_precision", 0.0)) - 0.01
+        )
+        if evidence_ok and precision_ok and refined_score >= baseline_score - 2.0 and is_usable_topology(
             refined_details, refined_score, args.object_profile
         ):
             return refined, True, refined_details
@@ -440,9 +551,16 @@ def main():
     handle_expected = args.object_profile == "handled_container" and expects_handle_topology(images)
     base_colour = estimate_base_colour(images)
 
+    single_image_mode = len(images) == 1
+    model_id = "tencent/Hunyuan3D-2mini" if single_image_mode else "tencent/Hunyuan3D-2mv"
+    model_subfolder = (
+        "hunyuan3d-dit-v2-mini-turbo"
+        if single_image_mode
+        else "hunyuan3d-dit-v2-mv-turbo"
+    )
     pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        "tencent/Hunyuan3D-2mv",
-        subfolder="hunyuan3d-dit-v2-mv-turbo",
+        model_id,
+        subfolder=model_subfolder,
         variant="fp16",
         device="cuda",
     )
@@ -464,7 +582,11 @@ def main():
         group_index = index % len(view_groups)
         group = view_groups[group_index]
         group_images = [images[image_index] for image_index in group]
-        conditions = {name: image for name, image in zip(view_names, group_images)}
+        conditions = (
+            group_images[0]
+            if single_image_mode
+            else {name: image for name, image in zip(view_names, group_images)}
+        )
         group_aspect = expected_silhouette_aspect(group_images)
         seed = args.seed + index * 7919
         attempted_count += 1
@@ -552,19 +674,9 @@ def main():
     recovery_mode = str(best_details.get("recovery_mode", "none"))
     recovery_warnings = []
     if best_mesh is None or not is_usable_topology(best_details, best_score, args.object_profile):
-        best_mesh, recovery_mode = build_estimated_proxy(best_mesh, expected_aspect)
-        best_score, proxy_details = candidate_score(best_mesh, expected_aspect, handle_expected)
-        proxy_details.update(
-            {
-                "index": best_details.get("index", 0),
-                "seed": best_details.get("seed"),
-                "recovery_mode": recovery_mode,
-            }
-        )
-        best_details = proxy_details
-        result_tier = "estimated"
-        recovery_warnings.append(
-            "As vistas não suportaram uma malha detalhada estável; foi criada uma aproximação volumétrica segura."
+        raise RuntimeError(
+            "Nenhuma hipótese produziu geometria 3D volumétrica coerente. "
+            "Adiciona uma vista frontal ou lateral; o Studio não vai criar uma placa ou proxy."
         )
     elif recovery_mode == "mesh_repair":
         recovery_warnings.append(
@@ -587,6 +699,13 @@ def main():
     )
     # Keep candidate identity/recovery metadata while reporting final geometry.
     best_details = {**best_details, **refined_details}
+    canonical_view = "multiview"
+    canonical_view_score = 0.0
+    if len(images) == 1:
+        best_mesh, canonical_view, canonical_view_score = orient_single_view_for_display(
+            best_mesh,
+            images[0],
+        )
     optimized_components = best_mesh.split(only_watertight=False)
     optimized_main = max(optimized_components, key=lambda component: len(component.faces))
     handle_preserved = bool(optimized_main.is_watertight and optimized_main.euler_number <= 0)
@@ -654,20 +773,29 @@ def main():
         "estimated_geometry": result_tier == "estimated",
         "inferred_geometry": True,
         "object_profile": args.object_profile,
+        "shape_model": model_id,
         "handle_expected": handle_expected,
         "handle_preserved": handle_preserved,
         "surface_smoothed": surface_smoothed,
+        "canonical_view": canonical_view,
+        "canonical_view_score": round(canonical_view_score, 4),
         "main_face_ratio": best_details.get("main_face_ratio", 0),
         "significant_components": best_details.get("significant_components", 0),
         "secondary_planar_component": best_details.get("secondary_planar_component", False),
         "dominant_sheet_ratio": best_details.get("dominant_sheet_ratio", 0),
+        "volumetric_depth_ratio": best_details.get("volumetric_depth_ratio", 0),
         "silhouette_evidence": best_details.get("silhouette_evidence", 0),
         "ordered_silhouette": best_details.get("ordered_silhouette", 0),
         "all_view_silhouette": best_details.get("all_view_silhouette", 0),
+        "silhouette_precision": best_details.get("silhouette_precision", 0),
+        "silhouette_recall": best_details.get("silhouette_recall", 0),
+        "silhouette_area_ratio": best_details.get("silhouette_area_ratio", 0),
         "view_groups": len(view_groups),
         "validation_views": len(images),
         "base_color": [int(value) for value in base_colour],
         "material": material_mode,
+        "texture_visibility_aware": material_mode == "multiview_uv_texture",
+        "texture_source_views": len(best_texture_images),
         "output": str(output),
     }
     print(f"HUNYUAN_RESULT {json.dumps(result, separators=(',', ':'))}", flush=True)

@@ -134,6 +134,13 @@ install_requirements() {
 }
 
 install_requirements "SPAR3D Low VRAM" "$SPAR_REPO" "$SPAR_ENV" "flet==0.25.2"
+if ! "$SPAR_ENV/bin/python" -c "import gpytoolbox, pynanoinstantmeshes" 2>/dev/null; then
+    log "Instalar remalhagem oficial do SPAR3D"
+    (
+        cd "$SPAR_REPO"
+        retry "$SPAR_ENV/bin/python" -m pip install -r requirements-remesh.txt
+    )
+fi
 install_requirements "Stable Fast 3D" "$SF3D_REPO" "$SF3D_ENV" ""
 
 download_model() {

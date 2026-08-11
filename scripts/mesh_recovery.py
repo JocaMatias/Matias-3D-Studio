@@ -27,7 +27,7 @@ def repair_policy(object_profile: str = "auto") -> RepairPolicy:
     policies = {
         "compact": RepairPolicy(50, 0.006, 24, 0.055, True, True),
         "handled_container": RepairPolicy(24, 0.0015, 64, 0.14, False, True),
-        "thin_parts": RepairPolicy(8, 0.0002, 192, 0.32, False, True),
+        "thin_parts": RepairPolicy(8, 0.0002, 192, 0.32, False, False),
         "multi_component": RepairPolicy(8, 0.00015, 256, 0.38, False, True),
         "mechanical": RepairPolicy(16, 0.00025, 192, 0.34, False, True),
         "organic": RepairPolicy(24, 0.0012, 72, 0.15, False, True),
@@ -237,11 +237,15 @@ def is_usable_topology(details: dict, score: float, object_profile: str = "auto"
     policy = repair_policy(object_profile)
     component_limit = policy.maximum_components
     sheet_failure = policy.penalize_ground_sheets and float(details.get("dominant_sheet_ratio", 0.0)) >= 0.20
+    volume_ratio = details.get("volumetric_depth_ratio")
+    minimum_volume = 0.055 if object_profile == "thin_parts" else 0.08
+    volume_failure = volume_ratio is not None and float(volume_ratio) < minimum_volume
     return not (
         score < 35
         or float(details.get("main_face_ratio", 0)) < (0.30 if object_profile in {"mechanical", "multi_component", "thin_parts", "architecture"} else 0.45)
         or (bool(details.get("secondary_planar_component", False)) and object_profile not in {"architecture", "mechanical", "thin_parts"})
         or sheet_failure
+        or volume_failure
         or (
             int(details.get("significant_components", 999)) > component_limit
             and float(details.get("main_face_ratio", 0)) < 0.55

@@ -1,5 +1,9 @@
 $ErrorActionPreference = "Stop"
 $PidFile = Join-Path $PSScriptRoot ".pids.json"
+$FrontendPort = 3100
+$BackendPort = 8100
+$FrontendUrl = "http://127.0.0.1:$FrontendPort"
+$BackendUrl = "http://127.0.0.1:$BackendPort"
 
 function Get-ListeningProcessId {
   param([int]$Port)
@@ -27,20 +31,20 @@ if (Test-Path -LiteralPath $PidFile) {
 
 # Next.js pode criar um processo filho que sobrevive ao processo registado.
 # Termina também os listeners conhecidos, mas apenas se responderem como Studio.
-$BackendListener = Get-ListeningProcessId 8000
+$BackendListener = Get-ListeningProcessId $BackendPort
 if ($BackendListener) {
   try {
-    $Health = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health" -TimeoutSec 2
+    $Health = Invoke-RestMethod -Uri "$BackendUrl/api/health" -TimeoutSec 2
     if ($Health.status -eq "ok" -and $null -ne $Health.reconstruction) {
       Stop-KnownProcess $BackendListener
     }
   } catch {}
 }
 
-$FrontendListener = Get-ListeningProcessId 3000
+$FrontendListener = Get-ListeningProcessId $FrontendPort
 if ($FrontendListener) {
   try {
-    $Response = Invoke-WebRequest -Uri "http://127.0.0.1:3000" -UseBasicParsing -TimeoutSec 2
+    $Response = Invoke-WebRequest -Uri $FrontendUrl -UseBasicParsing -TimeoutSec 2
     if ($Response.Content -match "Matias 3D Studio") {
       Stop-KnownProcess $FrontendListener
     }

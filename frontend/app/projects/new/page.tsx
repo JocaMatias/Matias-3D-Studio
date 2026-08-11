@@ -2,8 +2,8 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, Lock, ScanLine, Sparkles } from "lucide-react";
-import { Project, ProjectType, request } from "@/lib/api";
+import { ArrowRight, Sparkles } from "lucide-react";
+import { Project, request } from "@/lib/api";
 
 const profiles = [
   ["auto", "Automático"],
@@ -18,7 +18,6 @@ const profiles = [
 
 export default function NewProject() {
   const router = useRouter();
-  const [projectType, setProjectType] = useState<ProjectType>("ai_generation");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -30,7 +29,7 @@ export default function NewProject() {
     try {
       const project = await request<Project>("/api/projects", {
         method: "POST",
-        body: JSON.stringify({ ...Object.fromEntries(form), project_type: projectType }),
+        body: JSON.stringify({ ...Object.fromEntries(form), project_type: "ai_generation" }),
       });
       router.push(`/projects/${project.id}/capture`);
     } catch (reason) {
@@ -42,26 +41,13 @@ export default function NewProject() {
   return (
     <main className="shell">
       <form className="card form" onSubmit={submit}>
-        <h1>Como queres criar o modelo?</h1>
-        <p className="sub">A versão atual cria localmente a partir de uma imagem. A digitalização real será adicionada numa fase própria.</p>
-        {error && <p className="error">{error}</p>}
-
-        <div className="field">
-          <label>Modo</label>
-          <div className="choice-grid">
-            <button className={`choice ${projectType === "ai_generation" ? "active" : ""}`} type="button" onClick={() => setProjectType("ai_generation")}>
-              <Sparkles size={22} color="var(--mint)" />
-              <strong style={{ display: "block", margin: "10px 0 5px", color: "var(--text)" }}>Criar com IA</strong>
-              <span className="sub" style={{ fontSize: 12 }}>Uma imagem principal. O motor local estima as zonas invisíveis, cria textura e exporta GLB.</span>
-            </button>
-            <button className="choice" type="button" disabled title="Em desenvolvimento">
-              <ScanLine size={22} color="var(--muted)" />
-              <strong style={{ display: "block", margin: "10px 0 5px", color: "var(--text)" }}>Digitalizar objeto real</strong>
-              <span className="sub" style={{ fontSize: 12 }}>Muitas fotografias reais, geometria baseada em observação e textura fotográfica.</span>
-              <span className="badge" style={{ marginTop: 10 }}><Lock size={12} /> Em desenvolvimento</span>
-            </button>
-          </div>
+        <div className="row" style={{ justifyContent: "flex-start", gap: 10 }}>
+          <Sparkles size={23} color="var(--mint)" />
+          <span className="eyebrow">GEOMETRIA ASSISTIDA POR IA</span>
         </div>
+        <h1>Transforma uma fotografia num modelo 3D.</h1>
+        <p className="sub">O Matias isola o objeto, gera vários candidatos localmente, compara a forma e incorpora a referência como textura PBR.</p>
+        {error && <p className="error">{error}</p>}
 
         <div className="field">
           <label>Nome do projeto</label>
@@ -76,7 +62,7 @@ export default function NewProject() {
           <select className="input" name="object_profile" defaultValue="auto">
             {profiles.map(([value, label]) => <option value={value} key={value}>{label}</option>)}
           </select>
-          <span className="sub">Ajuda a preservar peças pequenas, cavidades, superfícies planas e partes finas durante a avaliação.</span>
+          <span className="sub">Automático reconhece casos comuns pelo nome. Escolhe manualmente apenas quando existem cavidades reais, pegas ou várias peças.</span>
         </div>
         <div className="field">
           <label>Categoria</label>
@@ -91,7 +77,7 @@ export default function NewProject() {
           </select>
         </div>
         <input type="hidden" name="capture_type" value="small_object" />
-        <button className="btn primary" disabled={busy}>{busy ? "A criar…" : "Criar e escolher imagem"}<ArrowRight size={17} /></button>
+        <button className="btn primary" disabled={busy}>{busy ? "A preparar o estúdio…" : "Continuar para a fotografia"}<ArrowRight size={17} /></button>
       </form>
     </main>
   );

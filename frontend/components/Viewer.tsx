@@ -2,7 +2,7 @@
 
 import { Canvas, useThree } from "@react-three/fiber";
 import { Center, ContactShadows, Environment, OrbitControls, useGLTF } from "@react-three/drei";
-import { Box, Expand, Grid3X3, Image as ImageIcon, Pause, Play, RotateCcw, Sun, Triangle } from "lucide-react";
+import { Box, Expand, Grid3X3, Image as ImageIcon, Images, Pause, Play, RotateCcw, Sun, Triangle } from "lucide-react";
 import { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 
@@ -24,7 +24,16 @@ function Model({ url, mode }: { url: string; mode: ViewMode }) {
       if (!(node instanceof THREE.Mesh)) return;
       node.castShadow = true;
       node.receiveShadow = true;
+      if (!node.geometry.getAttribute("normal")) node.geometry.computeVertexNormals();
       if (!originals.current.has(node.uuid)) originals.current.set(node.uuid, node.material);
+      const sourceMaterials = Array.isArray(node.material) ? node.material : [node.material];
+      sourceMaterials.forEach((material) => {
+        if (material instanceof THREE.MeshStandardMaterial && material.map) {
+          material.map.colorSpace = THREE.SRGBColorSpace;
+          material.map.anisotropy = 8;
+          material.needsUpdate = true;
+        }
+      });
       node.material = mode === "textured" ? originals.current.get(node.uuid)! : override;
     });
     return () => {
@@ -42,7 +51,7 @@ function CameraPosition({ view }: { view: CameraView }) {
   const { camera } = useThree();
   useEffect(() => {
     const positions: Record<CameraView, [number, number, number]> = {
-      perspective: [3.2, 2.25, 5.2],
+      perspective: [5.2, 2.25, 3.2],
       front: [0, 0.4, 5.8],
       back: [0, 0.4, -5.8],
       left: [-5.8, 0.4, 0],
@@ -61,23 +70,21 @@ export default function Viewer({
   url,
   hasTexture = true,
   hasVertexColors = false,
+  referenceUrl,
 }: {
   url: string;
   hasTexture?: boolean;
   hasVertexColors?: boolean;
+  referenceUrl?: string;
 }) {
   const root = useRef<HTMLDivElement>(null);
-  const canShowOriginal = hasTexture || hasVertexColors;
-  const [mode, setMode] = useState<ViewMode>(canShowOriginal ? "textured" : "solid");
+  const [mode, setMode] = useState<ViewMode>("textured");
   const [view, setView] = useState<CameraView>("perspective");
   const [grid, setGrid] = useState(true);
-  const [rotate, setRotate] = useState(true);
+  const [rotate, setRotate] = useState(false);
   const [light, setLight] = useState(1);
   const [background, setBackground] = useState<"dark" | "light">("dark");
-
-  useEffect(() => {
-    if (!canShowOriginal && mode === "textured") setMode("solid");
-  }, [canShowOriginal, mode]);
+  const [showReference, setShowReference] = useState(Boolean(referenceUrl));
 
   async function fullscreen() {
     if (!document.fullscreenElement) await root.current?.requestFullscreen();
@@ -87,7 +94,7 @@ export default function Viewer({
   return (
     <div className="viewer" ref={root}>
       <div className="viewer-toolbar" aria-label="Ferramentas do visualizador 3D">
-        <button className={`viewer-button ${mode === "textured" ? "active" : ""}`} disabled={!canShowOriginal} onClick={() => setMode("textured")} title={canShowOriginal ? (hasTexture ? "Texturizado" : "Cores por vértice") : "Textura indisponível nesta versão"}><ImageIcon size={16} /> {hasTexture ? "Textura" : hasVertexColors ? "Cores" : "Sem textura"}</button>
+        <button className={`viewer-button ${mode === "textured" ? "active" : ""}`} onClick={() => setMode("textured")} title={hasTexture ? "Textura PBR incorporada" : hasVertexColors ? "Cores por vértice" : "Material original do GLB"}><ImageIcon size={16} /> {hasTexture ? "Textura" : hasVertexColors ? "Cores" : "Material"}</button>
         <button className={`viewer-button ${mode === "solid" ? "active" : ""}`} onClick={() => setMode("solid")} title="Material sólido"><Box size={16} /> Sólido</button>
         <button className={`viewer-button ${mode === "wireframe" ? "active" : ""}`} onClick={() => setMode("wireframe")} title="Wireframe"><Triangle size={16} /> Malha</button>
         <button className="viewer-button" onClick={() => setView("perspective")} title="Perspetiva"><RotateCcw size={16} /></button>
@@ -101,9 +108,11 @@ export default function Viewer({
         <button className={`viewer-button ${rotate ? "active" : ""}`} onClick={() => setRotate((value) => !value)} title="Rotação automática">{rotate ? <Pause size={16} /> : <Play size={16} />}</button>
         <button className="viewer-button" onClick={() => setBackground((value) => value === "dark" ? "light" : "dark")} title="Alternar fundo"><Sun size={16} /></button>
         <label className="viewer-button" title="Intensidade da luz" style={{ display: "inline-flex", alignItems: "center", gap: 7 }}><Sun size={15} /><input type="range" min="0.35" max="1.7" step="0.05" value={light} onChange={(event) => setLight(Number(event.target.value))} /></label>
+        {referenceUrl && <button className={`viewer-button ${showReference ? "active" : ""}`} onClick={() => setShowReference((value) => !value)} title="Comparar com a fotografia original"><Images size={16} /> Referência</button>}
         <button className="viewer-button" onClick={() => void fullscreen()} title="Ecrã inteiro" style={{ marginLeft: "auto" }}><Expand size={16} /></button>
       </div>
-      <Canvas shadows camera={{ position: [3.2, 2.25, 5.2], fov: 38, near: 0.1, far: 100 }} gl={{ antialias: true, toneMappingExposure: 0.86 }}>
+      {referenceUrl && showReference && <figure className="viewer-reference"><img src={referenceUrl} alt="Fotografia de referência" /><figcaption>Referência original</figcaption></figure>}
+      <Canvas dpr={[1, 2]} shadows camera={{ position: [5.2, 2.25, 3.2], fov: 38, near: 0.1, far: 100 }} gl={{ antialias: true, toneMapping: THREE.ACESFilmicToneMapping, toneMappingExposure: 0.92 }}>
         <color attach="background" args={[background === "dark" ? "#060d0c" : "#cfd8d5"]} />
         <CameraPosition view={view} />
         <ambientLight intensity={0.46 * light} />

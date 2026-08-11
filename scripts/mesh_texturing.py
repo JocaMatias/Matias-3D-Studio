@@ -130,6 +130,122 @@ def _bilinear_rgba(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarra
     return top * (1.0 - wy) + bottom * wy
 
 
+def _rasterized_view_depth(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    camera_direction: np.ndarray,
+    horizontal_axis: int,
+    flip_horizontal: bool,
+    resolution: int = 320,
+) -> np.ndarray:
+    """Build an orthographic z-buffer in the same space used for colour projection.
+
+    A normal check alone is insufficient: a rear wing can face the camera while
+    still being hidden behind the front wing.  Sampling it from the photograph
+    duplicates markings across unrelated surfaces.  This depth map lets the CPU
+    baker colour only the foremost surface at each source-image coordinate.
+    """
+    resolution = max(64, int(resolution))
+    horizontal = vertices[:, horizontal_axis]
+    if flip_horizontal:
+        horizontal = 1.0 - horizontal
+    vertical = 1.0 - vertices[:, 1]
+    screen = np.column_stack(
+        (horizontal * (resolution - 1), vertical * (resolution - 1))
+    ).astype(np.float32)
+    depth = vertices @ np.asarray(camera_direction, dtype=np.float32)
+    depth_map = np.full((resolution, resolution), -np.inf, dtype=np.float32)
+
+    for face in faces:
+        triangle = screen[face]
+        x0 = max(0, int(np.floor(triangle[:, 0].min())))
+        x1 = min(resolution - 1, int(np.ceil(triangle[:, 0].max())))
+        y0 = max(0, int(np.floor(triangle[:, 1].min())))
+        y1 = min(resolution - 1, int(np.ceil(triangle[:, 1].max())))
+        if x1 < x0 or y1 < y0:
+            continue
+        grid_x, grid_y = np.meshgrid(
+            np.arange(x0, x1 + 1, dtype=np.float32) + 0.5,
+            np.arange(y0, y1 + 1, dtype=np.float32) + 0.5,
+        )
+        ax, ay = triangle[0]
+        bx, by = triangle[1]
+        cx, cy = triangle[2]
+        denominator = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+        if abs(float(denominator)) < 1e-8:
+            continue
+        wa = ((by - cy) * (grid_x - cx) + (cx - bx) * (grid_y - cy)) / denominator
+        wb = ((cy - ay) * (grid_x - cx) + (ax - cx) * (grid_y - cy)) / denominator
+        wc = 1.0 - wa - wb
+        inside = (wa >= -1e-4) & (wb >= -1e-4) & (wc >= -1e-4)
+        if not np.any(inside):
+            continue
+        interpolated = wa * depth[face[0]] + wb * depth[face[1]] + wc * depth[face[2]]
+        region = depth_map[y0 : y1 + 1, x0 : x1 + 1]
+        region[inside] = np.maximum(region[inside], interpolated[inside])
+    return depth_map
+
+
+def _visible_in_view(
+    positions: np.ndarray,
+    camera_direction: np.ndarray,
+    horizontal_axis: int,
+    flip_horizontal: bool,
+    depth_map: np.ndarray,
+) -> np.ndarray:
+    """Return whether projected surface samples are foremost in the source view."""
+    height, width = depth_map.shape
+    horizontal = positions[:, horizontal_axis]
+    if flip_horizontal:
+        horizontal = 1.0 - horizontal
+    sample_x = np.clip(np.rint(horizontal * (width - 1)), 0, width - 1).astype(np.int32)
+    sample_y = np.clip(np.rint((1.0 - positions[:, 1]) * (height - 1)), 0, height - 1).astype(np.int32)
+    front_depth = depth_map[sample_y, sample_x]
+    point_depth = positions @ np.asarray(camera_direction, dtype=np.float32)
+    tolerance = 3.0 / max(width, height)
+    return np.isfinite(front_depth) & (point_depth >= front_depth - tolerance)
+
+
+def _texture_subject_alpha(rgba: np.ndarray) -> np.ndarray:
+    """Remove uniform backdrop and soft cast shadows from a geometry mask.
+
+    Segmentation masks are intentionally permissive so they do not cut thin
+    geometry.  Texture projection needs a stricter interpretation: otherwise
+    a white sweep or its grey shadow becomes albedo on the model.  Strong
+    colour/darkness differences seed the subject and a small expansion keeps
+    highlights, emblems and thin attachments next to those reliable pixels.
+    """
+    from scipy import ndimage
+
+    alpha = rgba[:, :, 3] > 127
+    if not np.any(alpha):
+        return alpha
+    rgb = rgba[:, :, :3].astype(np.float32)
+    border = np.concatenate((rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]), axis=0)
+    background = np.median(border, axis=0)
+    border_distance = np.linalg.norm(border - background[None, :], axis=1)
+    # Do not apply aggressive subtraction when the photograph does not have a
+    # stable studio-like background.
+    if float(np.percentile(border_distance, 90)) > 42.0:
+        return alpha
+
+    distance = np.linalg.norm(rgb - background[None, None, :], axis=2)
+    maximum = np.maximum(rgb.max(axis=2), 1.0)
+    saturation = (rgb.max(axis=2) - rgb.min(axis=2)) / maximum
+    border_noise = float(np.percentile(border_distance, 98))
+    colour_threshold = max(30.0, border_noise + 18.0)
+    strong = alpha & (
+        ((saturation >= 0.14) & (distance >= colour_threshold))
+        | (distance >= max(82.0, colour_threshold * 1.8))
+    )
+    if int(strong.sum()) < max(32, int(alpha.sum() * 0.035)):
+        return alpha
+
+    expanded = ndimage.binary_dilation(strong, iterations=3) & alpha
+    expanded = ndimage.binary_fill_holes(expanded)
+    return expanded
+
+
 def apply_multiview_uv_texture(
     mesh,
     images: list[Image.Image],
@@ -168,14 +284,28 @@ def apply_multiview_uv_texture(
         (np.array([1.0, 0.0, 0.0], dtype=np.float32), 2, True),
     ]
     prepared_views = []
-    for image in images[:4]:
+    depth_resolution = min(448, max(256, int(texture_size) // 3))
+    for image, (camera_direction, horizontal_axis, flip_horizontal) in zip(
+        images[:4], view_specs
+    ):
         rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
-        alpha = rgba[:, :, 3] > 127
+        alpha = _texture_subject_alpha(rgba)
         ys, xs = np.where(alpha)
         prepared_views.append(
             None
             if not len(xs)
-            else (rgba, (int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())))
+            else (
+                rgba,
+                (int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())),
+                _rasterized_view_depth(
+                    (source_vertices - bounds_min) / bounds_span,
+                    source_faces,
+                    camera_direction,
+                    horizontal_axis,
+                    flip_horizontal,
+                    depth_resolution,
+                ),
+            )
         )
 
     size = int(np.clip(texture_size, 512, 2048))
@@ -225,7 +355,7 @@ def apply_multiview_uv_texture(
         ):
             if prepared is None:
                 continue
-            rgba, (source_x0, source_x1, source_y0, source_y1) = prepared
+            rgba, (source_x0, source_x1, source_y0, source_y1), depth_map = prepared
             horizontal = positions[:, horizontal_axis]
             if flip_horizontal:
                 horizontal = 1.0 - horizontal
@@ -233,8 +363,18 @@ def apply_multiview_uv_texture(
             sample_y = source_y0 + vertical * max(1, source_y1 - source_y0)
             sampled = _bilinear_rgba(rgba, sample_x, sample_y)
             facing = np.clip(pixel_normals @ camera_direction, 0.0, 1.0)
-            valid = sampled[:, 3] > 127
-            weight = np.where(valid, 0.04 + facing * facing, 0.0).astype(np.float32)
+            visible = _visible_in_view(
+                positions,
+                camera_direction,
+                horizontal_axis,
+                flip_horizontal,
+                depth_map,
+            )
+            # Grazing surfaces magnify a handful of source pixels into long
+            # streaks. Leave those unobserved and use the coherent base
+            # material instead of inventing photographic detail.
+            valid = (sampled[:, 3] > 127) & visible & (facing >= 0.18)
+            weight = np.where(valid, facing ** 3, 0.0).astype(np.float32)
             accumulated += sampled[:, :3] * weight[:, None]
             total_weight += weight
 

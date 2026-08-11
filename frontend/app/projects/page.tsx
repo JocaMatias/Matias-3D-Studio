@@ -9,7 +9,6 @@ export default function Projects() {
   const [items, setItems] = useState<Project[]>([]);
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("all");
-  const [type, setType] = useState("all");
   const [error, setError] = useState("");
   const load = () => request<Project[]>("/api/projects").then(setItems).catch((reason) => setError(reason.message));
 
@@ -18,9 +17,8 @@ export default function Projects() {
   const filtered = useMemo(() => items.filter((project) => {
     const text = `${project.name} ${project.description} ${project.category}`.toLowerCase();
     return text.includes(query.toLowerCase())
-      && (status === "all" || project.status === status)
-      && (type === "all" || project.project_type === type);
-  }), [items, query, status, type]);
+      && (status === "all" || project.status === status);
+  }), [items, query, status]);
 
   async function remove(id: string) {
     if (!confirm("Eliminar este projeto, as versões e os respetivos ficheiros?")) return;
@@ -49,11 +47,6 @@ export default function Projects() {
           <option value="processing">Em processamento</option>
           <option value="failed">Com erro</option>
           <option value="uploading">Em preparação</option>
-        </select>
-        <select className="input" style={{ width: 180 }} value={type} onChange={(event) => setType(event.target.value)}>
-          <option value="all">Todos os tipos</option>
-          <option value="ai_generation">Criar com IA</option>
-          <option value="reality_scan">Digitalizar objeto real</option>
         </select>
       </div>
 

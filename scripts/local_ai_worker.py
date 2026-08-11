@@ -25,6 +25,8 @@ def parse_args():
     parser.add_argument("--cache", required=True)
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--texture-resolution", type=int, default=1024)
+    parser.add_argument("--remesh", choices=["none", "triangle", "quad"], default="none")
+    parser.add_argument("--vertex-count", type=int, default=-1)
     parser.add_argument("--low-vram", action="store_true")
     parser.add_argument("--run-id", default="manual")
     return parser.parse_args()
@@ -73,11 +75,22 @@ if args.engine == "spar3d":
     model.to(device)
     model.eval()
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+        remesh = args.remesh
+        if remesh == "triangle":
+            try:
+                import gpytoolbox  # noqa: F401
+            except ImportError:
+                remesh = "none"
+        elif remesh == "quad":
+            try:
+                import pynanoinstantmeshes  # noqa: F401
+            except ImportError:
+                remesh = "none"
         mesh, _ = model.run_image(
             [image],
             bake_resolution=args.texture_resolution,
-            remesh="none",
-            vertex_count=-1,
+            remesh=remesh,
+            vertex_count=args.vertex_count if remesh != "none" else -1,
             return_points=True,
         )
 else:
@@ -118,6 +131,8 @@ print(
             "seed": args.seed,
             "output": str(output),
             "peak_vram_mb": round(float(peak), 1),
+            "remesh": remesh if args.engine == "spar3d" else "none",
+            "vertex_count_target": args.vertex_count if args.engine == "spar3d" else -1,
         }
     ),
     flush=True,

@@ -4,6 +4,10 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $PidFile = Join-Path $PSScriptRoot ".pids.json"
 $ExpectedApiVersion = "0.4.0"
+$FrontendPort = 3100
+$BackendPort = 8100
+$FrontendUrl = "http://127.0.0.1:$FrontendPort"
+$BackendUrl = "http://127.0.0.1:$BackendPort"
 
 function Get-ListeningProcessId {
   param([int]$Port)
@@ -18,7 +22,7 @@ function Get-ListeningProcessId {
 
 function Get-BackendHealth {
   try {
-    return Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health" -TimeoutSec 2
+    return Invoke-RestMethod -Uri "$BackendUrl/api/health" -TimeoutSec 2
   } catch {
     return $null
   }
@@ -26,7 +30,7 @@ function Get-BackendHealth {
 
 function Get-FrontendResponse {
   try {
-    return Invoke-WebRequest -Uri "http://127.0.0.1:3000" -UseBasicParsing -TimeoutSec 2
+    return Invoke-WebRequest -Uri $FrontendUrl -UseBasicParsing -TimeoutSec 2
   } catch {
     return $null
   }
@@ -88,8 +92,8 @@ function Stop-StudioListener {
 
 # Reinicia sempre os serviços do Studio. Assim o atalho nunca mistura uma
 # interface nova com uma API antiga que permaneceu aberta em segundo plano.
-Stop-StudioListener -Port 3000 -Kind frontend
-Stop-StudioListener -Port 8000 -Kind backend
+Stop-StudioListener -Port $FrontendPort -Kind frontend
+Stop-StudioListener -Port $BackendPort -Kind backend
 
 # O processo filho do compilador SWC pode sobreviver ao listener do Next.js e
 # manter node_modules bloqueado. Identifica-o pelo módulo carregado dentro deste
@@ -132,6 +136,8 @@ $DatabaseUriPath = $DatabasePath.Replace("\", "/")
 # desktop shortcut, VS Code or another working directory behave identically.
 $env:DATABASE_URL = "sqlite:///$DatabaseUriPath"
 $env:STORAGE_ROOT = $StoragePath
+$env:FRONTEND_ORIGIN = $FrontendUrl
+$env:NEXT_PUBLIC_API_URL = $BackendUrl
 $FrontendPackage = Get-Content -LiteralPath (Join-Path $FrontendRoot "package.json") -Raw | ConvertFrom-Json
 $ExpectedNext = [string]$FrontendPackage.dependencies.next
 $InstalledNextPath = Join-Path $FrontendRoot "node_modules\next\package.json"
@@ -156,8 +162,8 @@ if (-not (Test-Path -LiteralPath $Next)) {
   throw "As dependências do frontend não ficaram disponíveis após npm ci."
 }
 
-$Backend = Start-Process -FilePath $Python -ArgumentList "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000" -WorkingDirectory (Join-Path $Root "backend") -WindowStyle Hidden -PassThru
-$Frontend = Start-Process -FilePath $Npm -ArgumentList "run", "dev" -WorkingDirectory $FrontendRoot -WindowStyle Hidden -PassThru
+$Backend = Start-Process -FilePath $Python -ArgumentList "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "$BackendPort" -WorkingDirectory (Join-Path $Root "backend") -WindowStyle Hidden -PassThru
+$Frontend = Start-Process -FilePath $Npm -ArgumentList "run", "dev", "--", "-p", "$FrontendPort" -WorkingDirectory $FrontendRoot -WindowStyle Hidden -PassThru
 
 @{
   backend = $Backend.Id
@@ -196,8 +202,8 @@ $Edge = $EdgeCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
 
 if (-not $NoLaunch) {
   if ($Edge) {
-    Start-Process -FilePath $Edge -ArgumentList "--app=http://127.0.0.1:3000", "--start-maximized"
+    Start-Process -FilePath $Edge -ArgumentList "--app=$FrontendUrl", "--start-maximized"
   } else {
-    Start-Process "http://127.0.0.1:3000"
+    Start-Process $FrontendUrl
   }
 }

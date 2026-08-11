@@ -136,6 +136,73 @@ def local_ai_engine_status() -> dict:
     }
 
 
+def release_ollama_models() -> dict:
+    """Free VRAM held by Ollama before loading a reconstruction model.
+
+    Ollama keeps models resident for a while after a request.  On an 8 GB GPU
+    that resident allocation is enough to make SPAR3D fail even in low-VRAM
+    mode.  Stopping a loaded model is safe: its files remain installed and
+    Ollama loads it again automatically on the next chat request.
+    """
+    executable = shutil.which("ollama")
+    if not executable:
+        return {"available": False, "released": [], "warning": None}
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        current = subprocess.run(
+            [executable, "ps"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            creationflags=flags,
+        )
+        models = []
+        for line in current.stdout.splitlines()[1:]:
+            columns = line.split()
+            if columns and columns[0] not in models:
+                models.append(columns[0])
+        released = []
+        for model in models:
+            stopped = subprocess.run(
+                [executable, "stop", model],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                creationflags=flags,
+            )
+            if stopped.returncode == 0:
+                released.append(model)
+        return {"available": True, "released": released, "warning": None}
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"available": True, "released": [], "warning": str(error)}
+
+
+def gpu_memory_snapshot() -> dict:
+    """Return a best-effort VRAM snapshot without making generation depend on it."""
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                executable,
+                "--query-gpu=memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        values = [int(value.strip()) for value in result.stdout.splitlines()[0].split(",")]
+        return {"total_mb": values[0], "used_mb": values[1], "free_mb": values[2]}
+    except (IndexError, OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
 def prepare_transparent_input(image_path: Path, mask_path: Path, output_path: Path) -> Path:
     with Image.open(image_path) as source, Image.open(mask_path) as mask_source:
         image = source.convert("RGBA")
@@ -328,6 +395,8 @@ def _run_wsl_local_ai_candidate(
     cache_dir: Path,
     seed: int,
     texture_resolution: int,
+    remesh: str,
+    vertex_count: int,
     timeout_seconds: float,
     log_path: Path,
     cancel_check: Callable[[], None] | None,
@@ -368,6 +437,10 @@ def _run_wsl_local_ai_candidate(
         str(seed),
         "--texture-resolution",
         str(texture_resolution),
+        "--remesh",
+        remesh,
+        "--vertex-count",
+        str(vertex_count),
         "--run-id",
         run_id,
     ]
@@ -435,6 +508,8 @@ def run_local_ai_candidate(
     texture_resolution: int,
     timeout_seconds: float,
     log_path: Path,
+    remesh: str = "none",
+    vertex_count: int = -1,
     cancel_check: Callable[[], None] | None = None,
 ) -> dict:
     if settings.local_ai_runtime.strip().lower() == "wsl":
@@ -445,6 +520,8 @@ def run_local_ai_candidate(
             cache_dir=cache_dir,
             seed=seed,
             texture_resolution=texture_resolution,
+            remesh=remesh,
+            vertex_count=vertex_count,
             timeout_seconds=timeout_seconds,
             log_path=log_path,
             cancel_check=cancel_check,
@@ -474,6 +551,10 @@ def run_local_ai_candidate(
         str(seed),
         "--texture-resolution",
         str(texture_resolution),
+        "--remesh",
+        remesh,
+        "--vertex-count",
+        str(vertex_count),
     ]
     if engine.low_vram:
         command.append("--low-vram")
@@ -510,8 +591,14 @@ def _as_mesh(source: Path) -> tuple[trimesh.Scene, trimesh.Trimesh]:
     try:
         mesh.remove_infinite_values()
         mesh.update_faces(mesh.nondegenerate_faces())
+        mesh.update_faces(mesh.unique_faces())
         mesh.remove_unreferenced_vertices()
-        mesh.merge_vertices()
+        # Marching-cubes candidates often duplicate vertices along texture or
+        # normal seams.  Counting those seams as disconnected geometry made a
+        # watertight object appear to be seven separate pieces.
+        mesh.merge_vertices(merge_tex=True, merge_norm=True)
+        mesh.remove_unreferenced_vertices()
+        trimesh.repair.fix_normals(mesh, multibody=True)
     except Exception:
         pass
     return scene, mesh
@@ -581,7 +668,11 @@ def _material_capabilities(scene: trimesh.Scene) -> dict:
         has_vertex_colors = has_vertex_colors or kind == "vertex"
         material = getattr(visual, "material", None)
         has_material = has_material or material is not None
-        image = getattr(material, "image", None) if material is not None else None
+        image = None
+        if material is not None:
+            image = getattr(material, "baseColorTexture", None)
+            if image is None:
+                image = getattr(material, "image", None)
         has_texture = has_texture or image is not None
     mode = "uv_texture" if has_texture else "vertex_colors" if has_vertex_colors else "pbr_uniform" if has_material else "none"
     return {
@@ -593,7 +684,131 @@ def _material_capabilities(scene: trimesh.Scene) -> dict:
     }
 
 
-def analyse_candidate(source: Path, mask_path: Path) -> dict:
+def _candidate_pose(mesh: trimesh.Trimesh, observed: np.ndarray) -> tuple[float, int, int, np.ndarray]:
+    """Find the observed front without allowing a silent horizontal mirror."""
+    best = (0.0, 0, 0, np.zeros_like(observed))
+    for pitch_deg in (-18, -9, 0, 9, 18):
+        for yaw_deg in range(0, 360, 15):
+            rendered = _render_silhouette(mesh, np.deg2rad(yaw_deg), np.deg2rad(pitch_deg))
+            score = _silhouette_similarity(observed, rendered)
+            if score > best[0]:
+                best = (score, yaw_deg, pitch_deg, rendered)
+    return best
+
+
+def _mask_skeleton(mask: np.ndarray) -> np.ndarray:
+    """Small dependency-free morphological skeleton for structural QA."""
+    from scipy import ndimage
+
+    current = mask.astype(bool)
+    skeleton = np.zeros_like(current)
+    structure = ndimage.generate_binary_structure(2, 1)
+    while current.any():
+        eroded = ndimage.binary_erosion(current, structure=structure)
+        opened = ndimage.binary_dilation(eroded, structure=structure)
+        skeleton |= current & ~opened
+        current = eroded
+    return skeleton
+
+
+def _structure_features(mask: np.ndarray) -> tuple[int, float]:
+    """Return skeleton endpoints and perimeter/area complexity."""
+    from scipy import ndimage
+
+    skeleton = _mask_skeleton(mask)
+    neighbours = ndimage.convolve(skeleton.astype(np.uint8), np.ones((3, 3), dtype=np.uint8), mode="constant")
+    endpoints = int(np.sum(skeleton & (neighbours == 2)))
+    boundary = mask & ~ndimage.binary_erosion(mask)
+    complexity = float(boundary.sum() / max(1, mask.sum()))
+    return endpoints, complexity
+
+
+def _maximum_cross_section_runs(mask: np.ndarray) -> int:
+    """Count separated branches after aligning the object's longest axis.
+
+    A fork has several foreground runs across a tine section while a spatula
+    or shovel has one. Alignment makes this independent of how the product was
+    rotated in the uploaded photograph.
+    """
+    from scipy import ndimage
+
+    ys, xs = np.where(mask)
+    if len(xs) < 12:
+        return 0
+    points = np.column_stack((xs - xs.mean(), ys - ys.mean()))
+    covariance = np.cov(points, rowvar=False)
+    axis = np.linalg.eigh(covariance)[1][:, -1]
+    angle = np.degrees(np.arctan2(axis[1], axis[0]))
+    aligned = ndimage.rotate(mask.astype(np.uint8), -angle, reshape=True, order=0) > 0
+    occupied = np.where(aligned.any(axis=0))[0]
+    if not len(occupied):
+        return 0
+    x0, x1 = int(occupied.min()), int(occupied.max())
+    margin = max(1, round((x1 - x0) * 0.03))
+    maximum = 1
+    for x in range(x0 + margin, x1 - margin + 1):
+        line = aligned[:, x]
+        runs = int(np.sum(line & ~np.pad(line[:-1], (1, 0), constant_values=False)))
+        maximum = max(maximum, runs)
+    return maximum
+
+
+def _structural_similarity(observed: np.ndarray, rendered: np.ndarray) -> tuple[float, dict]:
+    """Compare detail, not just the outer envelope of two silhouettes.
+
+    IoU can rate a shovel-like blade as a good fork because both occupy the
+    same broad envelope. Boundary distance and skeleton endpoints expose the
+    missing gaps and branches which carry the object's identity.
+    """
+    from scipy import ndimage
+
+    observed_edge = observed & ~ndimage.binary_erosion(observed)
+    rendered_edge = rendered & ~ndimage.binary_erosion(rendered)
+    if not observed_edge.any() or not rendered_edge.any():
+        return 0.0, {"observed_endpoints": 0, "rendered_endpoints": 0}
+    to_rendered = ndimage.distance_transform_edt(~rendered_edge)
+    to_observed = ndimage.distance_transform_edt(~observed_edge)
+    chamfer = (float(to_rendered[observed_edge].mean()) + float(to_observed[rendered_edge].mean())) / 2
+    edge_score = float(np.exp(-chamfer / 4.0))
+    observed_endpoints, observed_complexity = _structure_features(observed)
+    rendered_endpoints, rendered_complexity = _structure_features(rendered)
+    observed_runs = _maximum_cross_section_runs(observed)
+    rendered_runs = _maximum_cross_section_runs(rendered)
+    endpoint_score = 1.0 - min(1.0, abs(observed_endpoints - rendered_endpoints) / max(3, observed_endpoints))
+    complexity_score = min(observed_complexity, rendered_complexity) / max(observed_complexity, rendered_complexity, 1e-8)
+    if observed_runs >= 3:
+        run_score = min(1.0, rendered_runs / observed_runs)
+        run_score *= 1.0 if rendered_runs >= observed_runs - 1 else 0.35
+    else:
+        run_score = 1.0
+    score = float(np.clip(edge_score * 0.40 + endpoint_score * 0.18 + complexity_score * 0.12 + run_score * 0.30, 0, 1))
+    return score, {
+        "observed_endpoints": observed_endpoints,
+        "rendered_endpoints": rendered_endpoints,
+        "observed_cross_section_runs": observed_runs,
+        "rendered_cross_section_runs": rendered_runs,
+        "edge_match_score": round(edge_score * 100, 1),
+    }
+
+
+def _pose_matrix(yaw_deg: float, pitch_deg: float) -> np.ndarray:
+    yaw = np.deg2rad(yaw_deg)
+    pitch = np.deg2rad(pitch_deg)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    rotate_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    rotate_x = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
+    transform = np.eye(4)
+    transform[:3, :3] = rotate_x @ rotate_y
+    return transform
+
+
+def analyse_candidate(
+    source: Path,
+    mask_path: Path,
+    object_profile: str = "auto",
+    expected_cross_section_runs: int = 0,
+) -> dict:
     scene, mesh = _as_mesh(source)
     if len(mesh.faces) < 500 or len(mesh.vertices) < 250 or not np.isfinite(mesh.vertices).all():
         return {"score": 0.0, "usable": False, "reason": "geometria insuficiente"}
@@ -607,36 +822,217 @@ def analyse_candidate(source: Path, mask_path: Path) -> dict:
     main_ratio = face_counts[0] / total_faces
     significant = sum(count >= max(80, total_faces * 0.002) for count in face_counts)
     observed = _normalised_observed_mask(mask_path)
-    silhouette_scores = []
-    for pitch_deg in (-18, 0, 18):
-        for yaw_deg in range(0, 360, 20):
-            rendered = _render_silhouette(mesh, np.deg2rad(yaw_deg), np.deg2rad(pitch_deg))
-            silhouette_scores.append(_silhouette_similarity(observed, rendered))
-            silhouette_scores.append(_silhouette_similarity(observed, np.fliplr(rendered)))
-    silhouette = max(silhouette_scores) if silhouette_scores else 0.0
+    silhouette, yaw_deg, pitch_deg, rendered = _candidate_pose(mesh, observed)
+    structure, structure_detail = _structural_similarity(observed, rendered)
     materials = _material_capabilities(scene)
-    component_score = max(0.0, 1.0 - max(0, significant - 8) / 28)
-    geometry_score = float(np.clip(main_ratio * 72 + component_score * 28, 0, 100))
-    score = float(np.clip(silhouette * 55 + geometry_score * 0.30 + materials["texture_quality_score"] * 0.15, 0, 100))
+    component_score = max(0.0, 1.0 - max(0, significant - 1) / 18)
+    watertight_score = 1.0 if mesh.is_watertight else 0.45
+    triangle_score = float(np.clip(len(mesh.faces) / 5_000, 0.35, 1.0))
+    posed = mesh.copy()
+    posed.apply_transform(_pose_matrix(yaw_deg, pitch_deg))
+    extents = np.maximum(np.asarray(posed.extents, dtype=np.float64), 1e-8)
+    visible_span = max(float(extents[0]), float(extents[1]), 1e-8)
+    depth_ratio = float(extents[2] / visible_span)
+    min_depth = 0.018 if object_profile == "thin_parts" else 0.035
+    depth_score = float(np.clip(depth_ratio / min_depth, 0, 1))
+    if depth_ratio > 0.9:
+        depth_score *= max(0.2, 1.0 - (depth_ratio - 0.9))
+    geometry_score = float(np.clip(
+        main_ratio * 40
+        + component_score * 20
+        + watertight_score * 15
+        + triangle_score * 10
+        + depth_score * 15,
+        0,
+        100,
+    ))
+    if object_profile == "thin_parts":
+        score = float(np.clip(
+            silhouette * 35 + structure * 30 + geometry_score * 0.25 + materials["texture_quality_score"] * 0.10,
+            0,
+            100,
+        ))
+        expected_runs = (
+            int(expected_cross_section_runs)
+            or int(structure_detail.get("observed_cross_section_runs", 0))
+        )
+        actual_runs = int(structure_detail.get("rendered_cross_section_runs", 0))
+        branches_preserved = expected_runs < 3 or actual_runs >= expected_runs - 1
+        structurally_usable = structure >= 0.52 and branches_preserved
+    else:
+        score = float(np.clip(silhouette * 50 + structure * 0.05 + geometry_score * 0.30 + materials["texture_quality_score"] * 0.15, 0, 100))
+        structurally_usable = True
     return {
         "score": round(score, 2),
-        "usable": score >= 35 and main_ratio >= 0.35,
+        "usable": score >= 35 and main_ratio >= 0.35 and structurally_usable,
         "vertices": int(len(mesh.vertices)),
         "triangles": int(len(mesh.faces)),
         "main_component_ratio": round(float(main_ratio), 4),
         "significant_components": int(significant),
+        "watertight": bool(mesh.is_watertight),
+        "depth_ratio": round(depth_ratio, 4),
+        "front_yaw_deg": int(yaw_deg),
+        "front_pitch_deg": int(pitch_deg),
         "visual_match_score": round(float(silhouette * 100), 1),
+        "structural_match_score": round(float(structure * 100), 1),
+        **structure_detail,
         "geometry_quality_score": round(geometry_score, 1),
         **materials,
     }
 
 
-def select_best_candidate(candidates: list[dict], mask_path: Path) -> tuple[dict, list[dict]]:
+def apply_reference_texture(
+    source: Path,
+    reference_path: Path,
+    output_path: Path,
+    *,
+    yaw_deg: float,
+    pitch_deg: float,
+    material_hint: str = "",
+) -> dict:
+    """Orient and front-project the real reference into an embedded GLB map.
+
+    SPAR3D's low-VRAM path can return a uniform PBR material.  This portable
+    fallback produces a genuine embedded texture without another CUDA model.
+    The unseen rear remains an explicit inference, but the observed front now
+    retains the uploaded object's colours, highlights and markings.
+    """
+    _scene, mesh = _as_mesh(source)
+    if not len(mesh.faces):
+        raise RuntimeError("O candidato selecionado não contém geometria para texturizar.")
+    mesh.apply_transform(_pose_matrix(yaw_deg, pitch_deg))
+    mesh.apply_translation(-mesh.centroid)
+
+    with Image.open(reference_path) as opened:
+        rgba = opened.convert("RGBA")
+    pixels = np.asarray(rgba, dtype=np.uint8)
+    alpha = pixels[:, :, 3] > 16
+    ys, xs = np.where(alpha)
+    if not len(xs):
+        raise RuntimeError("A referência preparada não contém primeiro plano.")
+
+    foreground = pixels[alpha, :3]
+    base_colour = np.median(foreground, axis=0).astype(np.uint8)
+    texture = pixels[:, :, :3].copy()
+    texture[~alpha] = base_colour
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    low = vertices.min(axis=0)
+    span = np.maximum(vertices.max(axis=0) - low, 1e-8)
+    horizontal = (vertices[:, 0] - low[0]) / span[0]
+    vertical = (vertices[:, 1] - low[1]) / span[1]
+    # Keep a two-pixel inset to avoid sampling the former transparent border.
+    x0, x1 = int(xs.min()) + 2, int(xs.max()) - 2
+    y0, y1 = int(ys.min()) + 2, int(ys.max()) - 2
+    u = (x0 + horizontal * max(1, x1 - x0)) / max(1, rgba.width - 1)
+    # glTF's texture origin is bottom-left while PIL arrays are top-left.
+    v = 1.0 - (y0 + (1.0 - vertical) * max(1, y1 - y0)) / max(1, rgba.height - 1)
+    uv = np.column_stack((u, v)).astype(np.float32)
+
+    hint = material_hint.casefold()
+    metallic = 0.82 if any(word in hint for word in ("metal", "aço", "aco", "colher", "garfo", "faca", "crom")) else 0.08
+    roughness = 0.2 if metallic > 0.5 else 0.46
+    material = trimesh.visual.material.PBRMaterial(
+        name="Matias reference projection",
+        baseColorTexture=Image.fromarray(texture, mode="RGB"),
+        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+        metallicFactor=metallic,
+        roughnessFactor=roughness,
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(uv=uv, material=material)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(trimesh.Scene(mesh).export(file_type="glb"))
+    capabilities = _material_capabilities(trimesh.load(output_path, force="scene", process=False))
+    if not capabilities["has_texture"]:
+        raise RuntimeError("A textura foi criada, mas não ficou incorporada no GLB.")
+    return {**capabilities, "texture_quality_score": 86, "texture_source": "reference_projection"}
+
+
+def build_structure_preserving_candidate(mask_path: Path, output_path: Path) -> dict:
+    """Build a watertight recovery mesh whose observed fine parts cannot vanish.
+
+    Image-to-3D diffusion is still used for the regular candidates. When all of
+    them merge identity-defining parts, this deterministic reconstruction turns
+    the verified foreground into a softly varying shallow volume. It is more
+    honest than inventing a wrong object and preserves every observed tine,
+    opening and branch for subsequent texturing.
+    """
+    from scipy import ndimage
+
+    with Image.open(mask_path) as opened:
+        source = np.asarray(opened.convert("L")) > 127
+    ys, xs = np.where(source)
+    if len(xs) < 100:
+        raise RuntimeError("A máscara não contém detalhe suficiente para recuperação estrutural.")
+    crop = Image.fromarray((source[ys.min():ys.max() + 1, xs.min():xs.max() + 1] * 255).astype(np.uint8))
+    scale = min(1.0, 320 / max(crop.size))
+    resized = crop.resize(
+        (max(8, round(crop.width * scale)), max(8, round(crop.height * scale))),
+        Image.Resampling.NEAREST,
+    )
+    silhouette = np.asarray(resized) > 127
+    distance = ndimage.distance_transform_edt(silhouette)
+    depth = 11
+    centre = depth // 2
+    half_depth = np.clip(1 + np.rint(distance * 0.10).astype(np.int16), 1, 4)
+    volume = np.zeros((*silhouette.shape, depth), dtype=bool)
+    for z in range(depth):
+        volume[:, :, z] = silhouette & (np.abs(z - centre) <= half_depth)
+    mesh = trimesh.voxel.ops.matrix_to_marching_cubes(volume, pitch=1.0)
+    # marching-cubes coordinates follow row, column, depth; expose the source
+    # image as the XY front while retaining the inferred shallow Z volume.
+    vertices = np.asarray(mesh.vertices).copy()
+    mesh.vertices = np.column_stack((vertices[:, 1], -vertices[:, 0], vertices[:, 2]))
+    mesh.apply_translation(-mesh.centroid)
+    extent = max(float(mesh.extents[0]), float(mesh.extents[1]), 1e-8)
+    mesh.apply_scale(1.0 / extent)
+    try:
+        trimesh.smoothing.filter_taubin(mesh, lamb=0.42, nu=0.45, iterations=2)
+        trimesh.repair.fix_normals(mesh)
+    except Exception:
+        pass
+    material = trimesh.visual.material.PBRMaterial(
+        name="Matias structural recovery",
+        baseColorFactor=np.array([190, 196, 200, 255], dtype=np.uint8),
+        metallicFactor=0.78,
+        roughnessFactor=0.22,
+    )
+    mesh.visual = trimesh.visual.TextureVisuals(material=material)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(trimesh.Scene(mesh).export(file_type="glb"))
+    return {
+        "engine": "structural_recovery",
+        "engine_label": "Recuperação estrutural assistida",
+        "seed": 0,
+        "duration_seconds": 0.0,
+        "path": str(output_path),
+    }
+
+
+def select_best_candidate(
+    candidates: list[dict],
+    mask_path: Path,
+    object_profile: str = "auto",
+    expected_cross_section_runs: int = 0,
+) -> tuple[dict, list[dict]]:
     reports = []
     for candidate in candidates:
-        report = {**candidate, **analyse_candidate(Path(candidate["path"]), mask_path)}
+        report = {
+            **candidate,
+            **analyse_candidate(
+                Path(candidate["path"]),
+                mask_path,
+                object_profile,
+                expected_cross_section_runs,
+            ),
+        }
         reports.append(report)
     usable = [report for report in reports if report.get("usable")]
+    if expected_cross_section_runs and not usable:
+        raise RuntimeError(
+            "A IA não preservou as partes separadas que definem este objeto; "
+            "nenhum candidato passou a validação estrutural."
+        )
     pool = usable or reports
     if not pool:
         raise RuntimeError("Nenhum motor local produziu candidatos.")

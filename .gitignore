@@ -18,3 +18,31 @@ tools/*
 .matias-install-logs/
 .matias-test-temp/
 .matias-update-temp/
+# Codex temporary workspaces
+.codex-stage/
+
+# Development logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+.next/
+dist/
+build/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

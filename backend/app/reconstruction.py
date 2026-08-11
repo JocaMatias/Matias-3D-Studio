@@ -7,6 +7,7 @@ import struct
 import subprocess
 import threading
 import time
+import unicodedata
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,9 +20,12 @@ from .database import SessionLocal
 from .models import Artifact, Project, ReconstructionJob, ReconstructionVersion
 from .strategy import MINIMUM_AI_IMAGES, capture_metrics, normalize_generation_mode, strategy_for_project
 from .local_ai import (
+    apply_reference_texture,
     discover_local_ai_engines,
+    gpu_memory_snapshot,
     local_ai_engine_status,
     prepare_transparent_input,
+    release_ollama_models,
     run_local_ai_candidate,
     select_best_candidate,
 )
@@ -37,8 +41,8 @@ STAGES = [
     "Exportar GLB",
 ]
 
-PIPELINE_VERSION = "local-single-image-ai-v1"
-MASK_PIPELINE_VERSION = "isnet-quality-v2"
+PIPELINE_VERSION = "local-single-image-ai-v2"
+MASK_PIPELINE_VERSION = "hybrid-shadow-aware-v6"
 
 _LOCAL_JOB_QUEUE: queue.Queue[str] = queue.Queue()
 _LOCAL_WORKER_LOCK = threading.Lock()
@@ -354,7 +358,11 @@ def run_job(job_id: str) -> None:
         if mode == "mock":
             _run_mock(db, job, project)
         elif public_mode == "ai_generation":
-            _run_local_ai(db, job, project)
+            hunyuan_python, hunyuan_generator = _find_hunyuan_runtime()
+            if hunyuan_python and hunyuan_generator:
+                _run_hunyuan(db, job, project, "ai_generation")
+            else:
+                _run_local_ai(db, job, project)
         elif mode == "meshroom":
             _run_meshroom(db, job, project)
         else:
@@ -662,7 +670,7 @@ def _render_model_preview(source: Path, output: Path) -> None:
     # thumbnail angle automatically so a handle/wing is not hidden behind the
     # main body even though the actual GLB is complete.
     yaw_candidates = np.deg2rad(np.arange(0.0, 180.0, 15.0))
-    yaw = max(
+    profile_yaw = max(
         yaw_candidates,
         key=lambda angle: float(
             np.ptp(
@@ -679,6 +687,10 @@ def _render_model_preview(source: Path, output: Path) -> None:
             )
         ),
     )
+    # A pure profile can hide depth-defining parts (fork tines, handles,
+    # wings). Keep the longest silhouette, but reveal enough of the second
+    # horizontal axis to make the thumbnail visibly three-dimensional.
+    yaw = (profile_yaw + np.deg2rad(28.0)) % np.pi
     rotate_y = np.array([[np.cos(yaw), 0, np.sin(yaw)], [0, 1, 0], [-np.sin(yaw), 0, np.cos(yaw)]])
     vertices = vertices @ (rotate_x @ rotate_y).T
 
@@ -821,13 +833,205 @@ def _clean_mask_components(mask: Image.Image) -> np.ndarray:
     return np.isin(labels, list(keep))
 
 
-def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
+def _normalised_words(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _effective_object_profile(project) -> str:
+    requested = str(getattr(project, "object_profile", "auto") or "auto")
+    if requested != "auto":
+        return requested
+    hint = _normalised_words(
+        " ".join(
+            str(value or "")
+            for value in (getattr(project, "name", ""), getattr(project, "description", ""), getattr(project, "category", ""))
+        )
+    )
+    groups = (
+        ("handled_container", ("caneca", "chavena", "xicara", "mug", "jarro", "panela com pega")),
+        ("thin_parts", ("garfo", "fork", "oculos", "tesoura", "corrente", "arame", "tripod", "antena")),
+        ("mechanical", ("motor", "maquina", "engrenagem", "drone", "robot", "mecan")),
+        ("organic", ("planta", "animal", "pessoa", "personagem", "organico", "flor")),
+        ("architecture", ("edificio", "casa", "arquitetura", "fachada", "monumento")),
+        (
+            "compact",
+            (
+                "colher", "spoon", "faca", "bottle", "garrafa", "sapato", "capacete",
+                "produto", "relogio", "telefone", "camera", "vaso", "bola",
+            ),
+        ),
+    )
+    for profile, words in groups:
+        if any(word in hint for word in words):
+            return profile
+    category = _normalised_words(str(getattr(project, "category", "") or ""))
+    if category == "architecture":
+        return "architecture"
+    if category in {"character"}:
+        return "organic"
+    if category in {"vehicle"}:
+        return "mechanical"
+    return "auto"
+
+
+def _expected_cross_section_runs(project) -> int:
+    """Semantic contract for objects defined by repeated separated parts."""
+    hint = _normalised_words(
+        " ".join(
+            str(value or "")
+            for value in (getattr(project, "name", ""), getattr(project, "description", ""))
+        )
+    )
+    if any(word in hint for word in ("garfo", "fork")):
+        return 4
+    return 0
+
+
+def _stabilize_object_mask(values: np.ndarray, object_profile: str) -> np.ndarray:
+    """Prevent highlights on solid objects from becoming literal 3D holes."""
+    from scipy import ndimage
+
+    # Closing is useful on solid products, but it is destructive for forks,
+    # scissors, glasses and other objects whose identity lives in narrow gaps.
+    # Preserve the neural mask exactly for those profiles; a one-pixel closing
+    # was enough to join adjacent fork tines before reconstruction even began.
+    stabilized = values if object_profile == "thin_parts" else ndimage.binary_closing(values, iterations=1)
+    filled = ndimage.binary_fill_holes(stabilized)
+    holes = filled & ~stabilized
+    hole_ratio = float(holes.sum() / max(1, stabilized.sum()))
+    if object_profile in {"compact", "organic"}:
+        stabilized = filled
+    elif object_profile == "auto" and hole_ratio <= 0.055:
+        # Tiny enclosed voids are overwhelmingly segmentation noise. Larger
+        # holes remain available for rings, handles and open structures.
+        stabilized = filled
+    return stabilized
+
+
+def _mask_cross_section_runs(values: np.ndarray) -> int:
+    """Estimate separated thin branches after principal-axis alignment."""
+    from scipy import ndimage
+
+    ys, xs = np.where(values)
+    if len(xs) < 12:
+        return 0
+    points = np.column_stack((xs - xs.mean(), ys - ys.mean()))
+    axis = np.linalg.eigh(np.cov(points, rowvar=False))[1][:, -1]
+    angle = np.degrees(np.arctan2(axis[1], axis[0]))
+    aligned = ndimage.rotate(values.astype(np.uint8), -angle, reshape=True, order=0) > 0
+    occupied = np.where(aligned.any(axis=0))[0]
+    if not len(occupied):
+        return 0
+    x0, x1 = int(occupied.min()), int(occupied.max())
+    maximum = 1
+    for x in range(x0 + 2, x1 - 1):
+        line = aligned[:, x]
+        maximum = max(maximum, int(np.sum(line & ~np.pad(line[:-1], (1, 0), constant_values=False))))
+    return maximum
+
+
+def _high_contrast_background_mask(image_path: Path) -> np.ndarray | None:
+    """Recover narrow gaps that foreground neural masks sometimes merge."""
+    from scipy import ndimage
+
+    with Image.open(image_path) as opened:
+        pixels = np.asarray(opened.convert("RGB"), dtype=np.float32)
+    height, width = pixels.shape[:2]
+    band = max(8, round(min(height, width) * 0.045))
+    border = np.concatenate((
+        pixels[:band].reshape(-1, 3), pixels[-band:].reshape(-1, 3),
+        pixels[:, :band].reshape(-1, 3), pixels[:, -band:].reshape(-1, 3),
+    ))
+    background = np.median(border, axis=0)
+    border_noise = np.median(np.linalg.norm(border - background, axis=1))
+    distance = np.linalg.norm(pixels - background, axis=2)
+    foreground = distance > max(10.0, border_noise * 4 + 8)
+    labels, count = ndimage.label(foreground)
+    if not count:
+        return None
+    areas = np.bincount(labels.ravel())
+    areas[0] = 0
+    candidate = labels == int(np.argmax(areas))
+    coverage = float(candidate.mean())
+    if coverage < 0.008 or coverage > 0.72:
+        return None
+    return candidate
+
+
+def _refine_studio_subject_mask(image_path: Path, values: np.ndarray) -> np.ndarray:
+    """Remove cast shadows from foreground masks on uniform backgrounds.
+
+    Neural matting models often keep a product's contact shadow.  That is
+    harmless for a 2D cut-out, but image-to-3D models turn it into a literal
+    floor or a second wing.  On a sufficiently uniform background we can use
+    the border colour as negative evidence and keep pixels with real colour or
+    a decisive luminance difference.  Conservative confidence guards retain
+    the original neural mask for pale objects or complex scenes.
+    """
+    from scipy import ndimage
+
+    original = np.asarray(values, dtype=bool)
+    if not original.any():
+        return original
+    with Image.open(image_path) as opened:
+        pixels = np.asarray(opened.convert("RGB"), dtype=np.float32)
+    if pixels.shape[:2] != original.shape:
+        return original
+    height, width = original.shape
+    band = max(8, round(min(height, width) * 0.045))
+    border = np.concatenate((
+        pixels[:band].reshape(-1, 3), pixels[-band:].reshape(-1, 3),
+        pixels[:, :band].reshape(-1, 3), pixels[:, -band:].reshape(-1, 3),
+    ))
+    background = np.median(border, axis=0)
+    border_distance = np.linalg.norm(border - background, axis=1)
+    spread = float(np.percentile(border_distance, 90))
+    # A colour model is only trustworthy for a controlled/studio backdrop.
+    if spread > 22.0:
+        return original
+
+    distance = np.linalg.norm(pixels - background, axis=2)
+    chroma = pixels.max(axis=2) - pixels.min(axis=2)
+    border_chroma = border.max(axis=1) - border.min(axis=1)
+    luminance_delta = np.abs(pixels.mean(axis=2) - float(background.mean()))
+    colour_floor = max(11.0, float(np.percentile(border_chroma, 95)) + 7.0)
+    neutral_floor = max(58.0, spread * 3.0 + 38.0)
+    distance_floor = max(15.0, spread * 2.0 + 8.0)
+    refined = original & (distance > distance_floor) & (
+        (chroma > colour_floor) | (luminance_delta > neutral_floor)
+    )
+    refined = ndimage.binary_closing(refined, iterations=1)
+
+    labels, count = ndimage.label(refined)
+    if count:
+        areas = np.bincount(labels.ravel())
+        largest = int(areas[1:].max(initial=0))
+        minimum = max(10, round(largest * 0.00035))
+        keep = np.where(areas >= minimum)[0]
+        keep = keep[keep != 0]
+        refined = np.isin(labels, keep)
+    # Restore a single antialiased contour pixel, but never grow beyond what
+    # the neural model considered foreground.
+    refined = ndimage.binary_dilation(refined, iterations=1) & original
+    retained_ratio = float(refined.sum() / max(1, original.sum()))
+    coverage = float(refined.mean())
+    if coverage < 0.008 or not 0.34 <= retained_ratio <= 0.965:
+        return original
+    return refined
+
+
+def _prepare_object_masks(images_dir: Path, masks_dir: Path, object_profile: str = "auto") -> int:
     if not settings.enable_object_segmentation:
         return 0
     input_images = sorted(images_dir.glob("*.jpg"))
     signature = {
         "pipeline": MASK_PIPELINE_VERSION,
         "model": settings.segmentation_model,
+        "object_profile": object_profile,
         "images": [
             {"name": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             for path in input_images
@@ -865,6 +1069,11 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
             if fast_mask is None:
                 neural_pending.append(image_path)
                 continue
+            fast_values = _refine_studio_subject_mask(image_path, np.asarray(fast_mask) > 64)
+            fast_mask = Image.fromarray(
+                (_stabilize_object_mask(fast_values, object_profile) * 255).astype(np.uint8),
+                mode="L",
+            )
             fast_mask.save(masks_dir / f"{image_path.name}.png")
             fast_mask.save(masks_dir / f"{image_path.stem}.mask.png")
             created += 1
@@ -879,6 +1088,14 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
         with Image.open(image_path) as source:
             mask = remove(source.convert("RGB"), session=session, only_mask=True).convert("L")
         values = _clean_mask_components(mask)
+        values = _refine_studio_subject_mask(image_path, values)
+        values = _stabilize_object_mask(values, object_profile)
+        if object_profile == "thin_parts":
+            contrast_values = _high_contrast_background_mask(image_path)
+            if contrast_values is not None:
+                contrast_values = _refine_studio_subject_mask(image_path, contrast_values)
+            if contrast_values is not None and _mask_cross_section_runs(contrast_values) > _mask_cross_section_runs(values):
+                values = contrast_values
         coverage = float(np.mean(values))
         if coverage < 0.01 or coverage > 0.85:
             raise RuntimeError(
@@ -887,7 +1104,9 @@ def _prepare_object_masks(images_dir: Path, masks_dir: Path) -> int:
             )
         # Expand only a narrow anti-aliased edge.  Larger dilation closes handle
         # holes and makes thin structures look fused to the body.
-        mask = Image.fromarray((values * 255).astype(np.uint8), mode="L").filter(ImageFilter.MaxFilter(3))
+        mask = Image.fromarray((values * 255).astype(np.uint8), mode="L")
+        if object_profile != "thin_parts":
+            mask = mask.filter(ImageFilter.MaxFilter(3))
         mask.save(masks_dir / f"{image_path.name}.png")
         mask.save(masks_dir / f"{image_path.stem}.mask.png")
         created += 1
@@ -1489,7 +1708,8 @@ def _run_local_ai(db, job, project):
     image_count = _prepare_images(project, images_dir)
     if image_count < 1:
         raise RuntimeError("Carrega e valida uma imagem principal antes de gerar.")
-    mask_count = _prepare_object_masks(images_dir, masks_dir)
+    effective_profile = _effective_object_profile(project)
+    mask_count = _prepare_object_masks(images_dir, masks_dir, effective_profile)
     primary = images_dir / "image-0000.jpg"
     primary_mask = masks_dir / "image-0000.mask.png"
     if not primary.is_file() or not primary_mask.is_file():
@@ -1499,17 +1719,27 @@ def _run_local_ai(db, job, project):
 
     quality_profile = str((job.configuration or {}).get("quality_profile", "standard"))
     profile = {
-        "preview": {"candidates": 1, "texture": 512, "label": "Rápido"},
-        "standard": {"candidates": 2, "texture": 1024, "label": "Equilibrado"},
-        "high": {"candidates": 3, "texture": 2048, "label": "Alta qualidade"},
-    }.get(quality_profile, {"candidates": 2, "texture": 1024, "label": "Equilibrado"})
+        "preview": {"candidates": 1, "texture": 512, "vertices": 4000, "label": "Rápido"},
+        "standard": {"candidates": 2, "texture": 1024, "vertices": 6000, "label": "Equilibrado"},
+        "high": {"candidates": 3, "texture": 2048, "vertices": 9000, "label": "Alta qualidade"},
+    }.get(quality_profile, {"candidates": 2, "texture": 1024, "vertices": 6000, "label": "Equilibrado"})
     seeds = [1729, 4099, 7919]
     generated: list[dict] = []
     failures: list[str] = []
 
     _advance(db, job, stages[1], 100, "A imagem principal é a âncora de identidade desta versão")
     _advance(db, job, stages[2], 100, "As zonas invisíveis serão estimadas pelo motor local")
-    _advance(db, job, stages[3], 100, "A preparar candidatos sequenciais para uma GPU de 8 GB")
+    _advance(db, job, stages[3], 35, "A libertar VRAM ocupada por modelos de linguagem…")
+    vram_before = gpu_memory_snapshot()
+    ollama_release = release_ollama_models()
+    vram_after = gpu_memory_snapshot()
+    released = ollama_release.get("released", [])
+    memory_message = (
+        f"VRAM preparada · {', '.join(released)} descarregado temporariamente"
+        if released
+        else "VRAM verificada; os candidatos serão executados sequencialmente"
+    )
+    _advance(db, job, stages[3], 100, memory_message)
 
     primary_engine = engines[0]
     for index in range(int(profile["candidates"])):
@@ -1529,6 +1759,8 @@ def _run_local_ai(db, job, project):
                 cache_dir=cache_dir,
                 seed=seeds[index],
                 texture_resolution=int(profile["texture"]),
+                remesh="triangle" if primary_engine.key == "spar3d" else "none",
+                vertex_count=int(profile["vertices"]),
                 timeout_seconds=settings.reconstruction_timeout_hours * 3600,
                 log_path=log_path,
                 cancel_check=lambda: _check_job_cancelled(db, job),
@@ -1551,6 +1783,8 @@ def _run_local_ai(db, job, project):
                 cache_dir=cache_dir,
                 seed=seeds[0],
                 texture_resolution=min(1024, int(profile["texture"])),
+                remesh="none",
+                vertex_count=-1,
                 timeout_seconds=settings.reconstruction_timeout_hours * 3600,
                 log_path=log_path,
                 cancel_check=lambda: _check_job_cancelled(db, job),
@@ -1564,8 +1798,14 @@ def _run_local_ai(db, job, project):
     if not generated:
         raise RuntimeError("Nenhum motor local conseguiu gerar o modelo. " + " · ".join(failures[-2:]))
 
-    selected, reports = select_best_candidate(generated, primary_mask)
-    if float(selected.get("score", 0)) < 52 and len(engines) > 1 and selected.get("engine") != engines[1].key:
+    expected_runs = _expected_cross_section_runs(project)
+    selected, reports = select_best_candidate(generated, primary_mask, effective_profile, expected_runs)
+    compare_fallback = (
+        len(engines) > 1
+        and selected.get("engine") != engines[1].key
+        and (quality_profile != "preview" or float(selected.get("score", 0)) < 58)
+    )
+    if compare_fallback:
         fallback = engines[1]
         candidate_path = candidates_dir / f"{fallback.key}-comparison.glb"
         try:
@@ -1576,18 +1816,39 @@ def _run_local_ai(db, job, project):
                 cache_dir=cache_dir,
                 seed=seeds[0],
                 texture_resolution=min(1024, int(profile["texture"])),
+                remesh="none",
+                vertex_count=-1,
                 timeout_seconds=settings.reconstruction_timeout_hours * 3600,
                 log_path=log_path,
                 cancel_check=lambda: _check_job_cancelled(db, job),
             )
             generated.append({**runtime, "path": str(candidate_path)})
-            selected, reports = select_best_candidate(generated, primary_mask)
+            selected, reports = select_best_candidate(generated, primary_mask, effective_profile, expected_runs)
         except JobCancelled:
             raise
         except Exception as error:
             failures.append(str(error))
 
     _advance(db, job, stages[4], 100, f"Melhor candidato escolhido: {selected['engine_label']}")
+    if not selected.get("has_texture"):
+        _advance(db, job, stages[5], 35, "A projetar a fotografia original numa textura PBR incorporada…")
+        textured_path = candidates_dir / "selected-reference-textured.glb"
+        try:
+            texture_report = apply_reference_texture(
+                Path(selected["path"]),
+                prepared_input,
+                textured_path,
+                yaw_deg=float(selected.get("front_yaw_deg", 0)),
+                pitch_deg=float(selected.get("front_pitch_deg", 0)),
+                material_hint=" ".join(
+                    str(value or "")
+                    for value in (getattr(project, "name", ""), getattr(project, "description", ""), getattr(project, "category", ""))
+                ),
+            )
+            selected.update(texture_report)
+            selected["path"] = str(textured_path)
+        except Exception as error:
+            failures.append(f"Textura de referência: {error}")
     texture_mode = str(selected.get("texture_mode", "none"))
     texture_label = {
         "uv_texture": "Textura UV gerada localmente",
@@ -1603,6 +1864,9 @@ def _run_local_ai(db, job, project):
         "input": str(prepared_input),
         "quality_profile": quality_profile,
         "object_profile": getattr(project, "object_profile", "auto"),
+        "effective_object_profile": effective_profile,
+        "vram": {"before_release": vram_before, "after_release": vram_after},
+        "ollama_models_released": released,
         "selected": selected,
         "candidates": reports,
         "failures": failures,
@@ -1641,7 +1905,11 @@ def _run_local_ai(db, job, project):
         "selected_seed": selected.get("seed"),
         "single_image_generation": True,
         "texture_resolution": int(profile["texture"]),
-        "object_profile": getattr(project, "object_profile", "auto"),
+        "object_profile": effective_profile,
+        "requested_object_profile": getattr(project, "object_profile", "auto"),
+        "vram_before_release": vram_before,
+        "vram_after_release": vram_after,
+        "ollama_models_released": released,
     }
     db.commit()
     _finish(
@@ -1718,7 +1986,8 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     image_count = _prepare_images(project, images_dir)
     if image_count < MINIMUM_AI_IMAGES:
         raise RuntimeError(f"São necessárias pelo menos {MINIMUM_AI_IMAGES} fotografias utilizáveis.")
-    mask_count = _prepare_object_masks(images_dir, masks_dir)
+    effective_profile = _effective_object_profile(project)
+    mask_count = _prepare_object_masks(images_dir, masks_dir, effective_profile)
     _advance(db, job, stages[0], 100, f"{image_count} imagens e {mask_count} máscaras preparadas")
 
     candidates = sorted(images_dir.glob("image-*.jpg"))
@@ -1731,7 +2000,7 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     model_cache.mkdir(parents=True, exist_ok=True)
     texture_model = _hunyuan_texture_runtime(python)
     quality_profile = str((job.configuration or {}).get("quality_profile", "standard"))
-    generated_candidates = {"preview": 3, "standard": 8, "high": 8}.get(quality_profile, 8)
+    generated_candidates = {"preview": 2, "standard": 4, "high": 8}.get(quality_profile, 4)
     requested_sets = {"preview": 2, "standard": 3, "high": 4}.get(quality_profile, 3)
     view_sets = _select_conditioning_view_sets(candidates, masks_dir, requested_sets, 4)
     if not view_sets or any(len(group) == 0 for group in view_sets):
@@ -1761,7 +2030,14 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     )
     _advance(db, job, stages[2], 100, "A IA vai comparar hipóteses de câmara e superfícies ocultas")
     _advance(db, job, stages[3], 100, "Todas as silhuetas vão validar a representação generativa")
-    target_faces = int((job.configuration or {}).get("target_faces", 60000))
+    requested_target_faces = int((job.configuration or {}).get("target_faces", 60000))
+    # Diffusion outputs are dense; reducing every quality tier to 60k faces
+    # makes curved manufactured surfaces visibly faceted.  Keep enough geometry
+    # for smoothing while staying comfortable in the browser viewer.
+    minimum_faces = {"preview": 45_000, "standard": 75_000, "high": 110_000}.get(
+        quality_profile, 75_000
+    )
+    target_faces = max(requested_target_faces, minimum_faces)
     command = [
         str(python), str(generator),
         "--repo", str(_resolved_tool_root(settings.hunyuan_root)),
@@ -1774,14 +2050,16 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         "--candidates", str(generated_candidates),
         "--target-faces", str(target_faces),
         "--category", project.category,
+        "--object-profile", effective_profile,
         "--project-colors",
         "--manifest", str(manifest_path),
     ]
     if texture_model:
         command.extend(["--texture", "--texture-model", str(texture_model)])
+    shape_engine = "Hunyuan3D-2mini Turbo" if image_count == 1 else "Hunyuan3D-2mv Turbo"
     job.configuration = {
         **(job.configuration or {}),
-        "engine": "Hunyuan3D-2mv Turbo",
+        "engine": shape_engine,
         "strategy_key": strategy_key,
         "conditioning_views": sorted({image.name for group in view_sets for image in group}),
         "conditioning_view_sets": [[image.name for image in group] for group in view_sets],
@@ -1826,6 +2104,12 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
         "multiview_uv_texture": "Textura UV multivista local",
         "multiview_vertex_color": "Cores multivista projetadas",
     }.get(material_mode, "Material PBR uniforme")
+    texture_quality_score = {
+        "hunyuan_paint_multiview": 92,
+        "multiview_uv_texture": 78 if image_count == 1 else 86,
+        "multiview_vertex_color": 68,
+        "pbr_uniform": 45,
+    }.get(material_mode, 45)
     tier_label = " · aproximação segura" if result_tier == "estimated" else ""
     _advance(db, job, stages[5], 100, f"{texture_label} aplicado{tier_label}")
 
@@ -1840,6 +2124,16 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
     trackability = photogrammetry_trackability(project.images)
     estimates = capture_metrics(image_count, project.validation_score, trackability["level"], project.project_type)
     candidate_score = float(worker_result.get("candidate_score", 0))
+    silhouette_evidence = float(worker_result.get("silhouette_evidence", 0))
+    volumetric_depth_ratio = float(worker_result.get("volumetric_depth_ratio", 0))
+    volume_quality = min(100.0, volumetric_depth_ratio / 0.18 * 100.0)
+    measured_quality = round(min(
+        95.0,
+        min(100.0, candidate_score) * 0.55
+        + silhouette_evidence * 100.0 * 0.25
+        + volume_quality * 0.20,
+    ))
+    quality_status = "approved" if measured_quality >= 85 else "approved_with_warnings" if measured_quality >= 60 else "review_required"
     integrity_confidence = round(
         min(100.0, candidate_score) * 0.72
         + float(worker_result.get("main_face_ratio", 0)) * 28
@@ -1888,7 +2182,9 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "main_component_ratio": float(worker_result.get("main_face_ratio", 0)),
             "significant_components": int(worker_result.get("significant_components", 0)),
             "dominant_sheet_ratio": float(worker_result.get("dominant_sheet_ratio", 0)),
-            "silhouette_evidence": float(worker_result.get("silhouette_evidence", 0)),
+            "silhouette_evidence": silhouette_evidence,
+            "volumetric_depth_ratio": volumetric_depth_ratio,
+            "volumetric_quality": round(volume_quality),
             "all_view_silhouette": float(worker_result.get("all_view_silhouette", 0)),
             "handle_expected": bool(worker_result.get("handle_expected", False)),
             "handle_preserved": bool(worker_result.get("handle_preserved", False)),
@@ -1896,14 +2192,18 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "triangles_before_optimization": int(worker_result.get("faces_before_optimization", geometry["triangles"])),
             "texture_mode": texture_label,
             "texture_generated": texture_generated,
+            "texture_quality_score": texture_quality_score,
+            "texture_visibility_aware": bool(worker_result.get("texture_visibility_aware", False)),
+            "texture_source_views": int(worker_result.get("texture_source_views", conditioning_view_count)),
             "photogrammetry_trackability": trackability["score"],
-            "quality_score": estimates["visual_fidelity_estimate"],
+            "quality_score": measured_quality,
+            "quality_status": quality_status,
         },
         {
             "simulated": False,
             "displayable": True,
             "generative_ai": True,
-            "engine": "Hunyuan3D-2mv Turbo multi-candidato + PBR",
+            "engine": f"{shape_engine} multi-candidato + PBR",
             "strategy": strategy_key,
             "result_tier": result_tier,
             "recovery_mode": recovery_mode,
@@ -1917,7 +2217,10 @@ def _run_hunyuan(db, job, project, strategy_key: str = "ai_multiview"):
             "selected_candidate": int(worker_result.get("selected_candidate", 1)),
             "material": material_mode,
             "texture_projection": texture_generated,
+            "texture_quality_score": texture_quality_score,
+            "texture_visibility_aware": bool(worker_result.get("texture_visibility_aware", False)),
             "surface_smoothed": bool(worker_result.get("surface_smoothed", False)),
+            "volumetric_depth_ratio": volumetric_depth_ratio,
             "optimized_target_faces": target_faces,
             "source_format": ".glb",
         },
